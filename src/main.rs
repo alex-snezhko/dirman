@@ -1,10 +1,12 @@
 use std::env;
 use std::fs;
+use std::os::windows::prelude::*;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Sub};
-use console::{Term, Key};
+use console::{Term, Style};
+use chrono::{DateTime, Utc, Datelike, Timelike};
 
 #[derive(Debug, Clone, Copy)]
 struct Vector2 {
@@ -43,15 +45,18 @@ impl Sub for Vector2 {
     }
 }
 
-struct File {
+struct FileInfo {
     name: OsString,
     meta: fs::Metadata,
+    //size: String,
+    //last_modified: String,
     // TODO metadata
 }
 
 struct Directory {
     name: OsString,
-    files: Vec<File>,
+    meta: fs::Metadata,
+    files: Vec<FileInfo>,
     directories: Vec<Directory>,
 }
 
@@ -69,9 +74,20 @@ impl ScrollableArea {
     }
 }
 
+// #[derive(Clone, Copy)]
+// enum Which { Command, Tree, Contents }
+
+// struct CurrentArea {
+//     which: Which,
+//     area: ScrollableArea,
+// }
+
+#[derive(Clone, Copy, PartialEq)]
+enum CurrentArea { Command, Tree, Contents }
+
 struct TerminalManager<'a> {
-    term: Term,
-    root: Directory,
+    term: &'a Term,
+    root: &'a Directory,
     curr_dir: &'a Directory,
     tree_area: ScrollableArea,
     contents_area: ScrollableArea,
@@ -86,8 +102,20 @@ impl<'a> TerminalManager<'a> {
         }
 
         match tokens[0] {
-            "enter" => {},
-            "move" => {},
+            "enter" => {
+                if tokens.len() > 2 {
+                    //print_error("'enter' command must be followed by a directory");
+                }
+                let possible_dirs = self.to_directory(tokens[1]);
+                //Self::highlight_if_multiple(&possible_dirs);
+            },
+            "close" => {},
+            "open" => {},
+            "move" => {
+                if tokens.len() > 2 {
+                    //print_error("'enter' command must be followed by a directory");
+                }
+            },
             "rename" => {},
             "copy" => {},
             "new" => {},
@@ -95,12 +123,22 @@ impl<'a> TerminalManager<'a> {
         }
     }
 
+    fn print_error(&self, message: &str) {
+        //self.term.move_cursor_to(x: usize, y: usize)
+    }
+
+    fn highlight_if_multiple(&self, dirs: &Vec<&'a Directory>) {
+        if dirs.len() > 1 {
+            self.draw_tree(dirs, &mut 1, self.root, &mut Vector2 { x: 0, y: 0 });
+        }
+    }
+
     fn to_directory(&'a self, path: &str) -> Vec<&'a Directory> {
         let parts: Vec<&str> = path.split("/").collect();
         
-        let mut possible = vec![&self.root];
+        let mut possible = vec![self.root];
         for part in &parts {
-            let mut new: Vec<&'a Directory> = Vec::new();
+            let mut new: Vec<&'a Directory> = vec![];
             for dir in &possible {
                 Self::to_directory_helper(part, dir, &mut new);
             }
@@ -119,15 +157,178 @@ impl<'a> TerminalManager<'a> {
         }
     }
 
-    fn move_file(&self, file: &File, old_dir: &Directory, new_dir: &Directory) {
+    fn move_file(&self, file: &FileInfo, old_dir: &Directory, new_dir: &Directory) {
         //fs::
+    }
+
+    fn draw_outline(&self, panel: CurrentArea) -> io::Result<()> {
+        let (height, width) = {
+            let size = self.term.size();
+            (size.0 as usize, size.1 as usize)
+        };
+
+        let line_x = (width as f64 * 0.6) as usize;
+    
+        self.term.move_cursor_to(0, 0)?;
+        self.term.write_line("DirMan")?;
+
+        let color = Style::new().red();
+        let print_with_color = |text: &str, when: Vec<CurrentArea>| -> io::Result<()> {
+            let colored = if when.contains(&panel) {
+                format!("{}", color.apply_to(text))
+            } else {
+                text.to_string()
+            };
+            self.term.write_str(&colored)?;
+            Ok(())
+        };
+        
+        use CurrentArea::*;
+
+        for _ in 0..line_x {
+            print_with_color("━", vec![Tree])?;
+        }
+        print_with_color("┳", vec![Tree, Contents])?;
+        for _ in line_x+1..width {
+            print_with_color("━", vec![Contents])?;
+        }
+        self.term.write_line("")?;
+        
+        for _ in 0..height-4 {
+            for _ in 0..line_x {
+                self.term.move_cursor_right(line_x)?;
+            }
+            print_with_color("┃", vec![Tree, Contents])?;
+            self.term.write_line("")?;
+        }
+    
+        for _ in 0..line_x {
+            print_with_color("━", vec![Tree, Command])?;
+        }
+        print_with_color("┻", vec![Tree, Contents, Command])?;
+        for _ in line_x+1..width {
+            print_with_color("━", vec![Contents, Command])?;
+        }
+        self.term.write_line("")?;
+
+        print!(" > ");
+        io::stdout().flush()?;
+
+        Ok(())
+    }
+
+    fn draw_tree(
+        &self,
+        selected_dirs: &Vec<&'a Directory>,
+        selected_dir_num: &mut i32,
+        curr_dir: &'a Directory,
+        curr_dir_pos: &mut Vector2,
+    ) -> io::Result<()> {
+        let begin_pos = *curr_dir_pos;
+
+        let curr_dir_name = curr_dir.name.to_str().unwrap();
+    
+        // convenience closure to prevent repetition
+        let print_dir_with_color = |color| print_to_area(self.term, &self.tree_area,
+            curr_dir_name, color, begin_pos);
+
+        // print directory with appropriate color
+        if selected_dirs.iter().any(|&e| e as *const Directory == curr_dir as *const Directory) {
+            print_dir_with_color(Style::new().red())?;
+            print_to_area(self.term, &self.tree_area, &format!(": {}", selected_dir_num),
+                Style::new().red().bold(), begin_pos + Vector2 { x: curr_dir_name.len(), y: 0 })?;
+            *selected_dir_num += 1;
+        } else if curr_dir as *const Directory == self.curr_dir as *const Directory {
+            print_dir_with_color(Style::new().blue())?;
+        } else {
+            print_dir_with_color(Style::new().white())?;
+        }
+    
+        let dirs = &curr_dir.directories;
+        for (i, dir) in dirs.iter().enumerate() {
+            curr_dir_pos.x = begin_pos.x + 3;
+            curr_dir_pos.y += 1;
+    
+            let to_print = if i == dirs.len() - 1 {
+                "└─" // U+2514 U+2500
+            } else {
+                "├─" // U+251C U+2500
+            };
+    
+            print_to_area(self.term, &self.tree_area, to_print, Style::new().white(),
+                Vector2 { x: begin_pos.x, y: curr_dir_pos.y })?;
+            
+            let init_y = begin_pos.y;
+            self.draw_tree(selected_dirs, selected_dir_num, dir, curr_dir_pos)?;
+    
+            for i in init_y+2..curr_dir_pos.y-1 {
+                print_to_area(self.term, &self.tree_area, "|", Style::new().white(),
+                    Vector2 { x: begin_pos.x, y: i })?;
+            }
+        }
+    
+        Ok(())
+    }
+
+    fn draw_contents(&self) -> io::Result<()> {
+        let term = self.term;
+        let area = &self.contents_area;
+
+        // 19 spaces for date
+        print_to_area(term, area, "Last Modified           Size  Name", Style::new().white(), Vector2 { x: 1, y: 0 })?;
+        print_to_area(term, area, "-------------           ----  ----", Style::new().white(), Vector2 { x: 1, y: 1 })?;
+        print_to_area(term, area, "- Directories -",             Style::new().white(), Vector2 { x: 1, y: 2 })?;
+
+        let mut curr_y = 3;
+        for dir in &self.curr_dir.directories {
+            let last_mod = DateTime::<Utc>::from(dir.meta.modified()?);
+
+            let (pm, hour) = last_mod.hour12();
+            print_to_area(term, area, &format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
+                last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
+                hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
+                dir.name.to_str().unwrap()),                            // file name
+                Style::new().white(), Vector2 { x: 1, y: curr_y })?;
+            curr_y += 1;
+        }
+
+        curr_y += 1;
+        print_to_area(term, area, "- Files -", Style::new().white(), Vector2 { x: 1, y: curr_y })?;
+        curr_y += 1;
+
+        for file in &self.curr_dir.files {
+            let last_mod = DateTime::<Utc>::from(file.meta.modified()?);
+
+            let (pm, hour) = last_mod.hour12();
+            print_to_area(term, area, &format!("{:02}/{:02}/{:02} {:02}:{:02} {}  {:>7}  {}",
+                last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
+                hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
+                file_size_to_str(file.meta.file_size()),                 // file size string
+                file.name.to_str().unwrap()),                            // file name
+                Style::new().white(), Vector2 { x: 1, y: curr_y })?;
+            curr_y += 1;
+        }
+        Ok(())
     }
 }
 
+fn file_size_to_str(size: u64) -> String {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    const KB: u64 = 1024;
 
+    if size >= GB {
+        format!("{:.0} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.0} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.0} KB", size as f64 / KB as f64)
+    } else {
+        format!("{} B", size)
+    }
+}
 
 fn main() -> io::Result<()> {
-
     // parse command line arguments and extract directory
     let args: Vec<String> = env::args().collect();
 
@@ -145,12 +346,7 @@ fn main() -> io::Result<()> {
     }
 
     // construct directory tree
-    let mut root = Directory {
-        name: OsString::from(path),
-        files: vec![],
-        directories: vec![],
-    };
-    load_dirs(&mut root, path)?;
+    let root = load_dir(path)?;
 
     let term = Term::stdout();
 
@@ -161,79 +357,91 @@ fn main() -> io::Result<()> {
     };
 
     let line_x = (size.x as f64 * 0.6) as usize;
-
-    let tree_area = ScrollableArea {
-        screen_offset: Vector2 { x: 1, y: 3 },
-        size: Vector2 { x: line_x - 2, y: size.y - 6 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-    };
-
-    let contents_area = ScrollableArea {
-        screen_offset: Vector2 { x: line_x + 2, y: 3 },
-        size: Vector2 { x: (size.x - line_x) - 2, y: size.y - 6 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-    };
-
-    let command_area = ScrollableArea {
-        screen_offset: Vector2 { x: 3, y: size.y - 2 },
-        size: Vector2 { x: size.x - 2, y: 1 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-    };
     
     let manager = TerminalManager {
-        term,
+        term: &term,
+        root: &root,
+        curr_dir: &root,
+
+        tree_area: ScrollableArea {
+            screen_offset: Vector2 { x: 1, y: 3 },
+            size: Vector2 { x: line_x - 2, y: size.y - 6 },
+            curr_pos: Vector2 { x: 0, y: 0 },
+        },
+
+        contents_area: ScrollableArea {
+            screen_offset: Vector2 { x: line_x + 2, y: 3 },
+            size: Vector2 { x: (size.x - line_x) - 2, y: size.y - 6 },
+            curr_pos: Vector2 { x: 0, y: 0 },
+        },
         
-        //curr_dir: { &root },
-        root,
-        tree_area,
-        contents_area,
-        command_area,
+        command_area: ScrollableArea {
+            screen_offset: Vector2 { x: 3, y: size.y - 2 },
+            size: Vector2 { x: size.x - 2, y: 1 },
+            curr_pos: Vector2 { x: 0, y: 0 },
+        },
     };
 
     //draw(&term, &manager);
-    draw_outline(size.y, size.x);
-    draw_tree(&manager, &manager.root, &mut (manager.tree_area.screen_offset + manager.tree_area.curr_pos))?;
+    for _ in 0..size.y {
+        term.write_line("")?;
+    }
 
-    let term = &manager.term;
+    let mut curr_area = CurrentArea::Command;
+    manager.draw_outline(CurrentArea::Command)?;
+    manager.draw_tree(&vec![], &mut 0, &manager.root, &mut Vector2{ x: 0, y: 0 })?;
+    manager.draw_contents()?;
+
     term.move_cursor_to(3, size.y - 1)?;
-
-    //let line = term.read_line()?;
-    let mut curr_area = 0;
+    
     let mut command = String::new();
     loop {
         let key = term.read_key()?;
 
         use console::Key::*;
         match key {
-            Escape => {
-                curr_area = 1;
-            },
-            ArrowLeft => {
-                if curr_area == 2 {
-                    curr_area = 1;
-                    // TODO switch(1);
+            ArrowUp => {
+                if let CurrentArea::Command = curr_area {
+                    curr_area = CurrentArea::Tree;
+                    manager.draw_outline(CurrentArea::Tree)?;
+                    manager.term.hide_cursor()?;
                 }
             },
             ArrowRight => {
-                if curr_area == 1 {
-                    curr_area = 2;
-                    // TODO switch(2);
+                if let CurrentArea::Tree = curr_area {
+                    curr_area = CurrentArea::Contents;
+                    manager.draw_outline(CurrentArea::Contents)?;
                 }
             },
-            ArrowDown => {
-                if curr_area != 0 {
-                    curr_area = 0;
-                    // TODO switch(0);
+            ArrowDown | Escape => {
+                if curr_area != CurrentArea::Command {
+                    curr_area = CurrentArea::Command;
+                    manager.draw_outline(CurrentArea::Command)?;
+                    manager.term.show_cursor()?;
                 }
             },
-            ArrowUp => {
-                if curr_area == 0 {
-                    curr_area = 1;
+            ArrowLeft => {
+                if let CurrentArea::Contents = curr_area {
+                    curr_area = CurrentArea::Tree;
+                    manager.draw_outline(CurrentArea::Tree)?;
                 }
             },
             Char(c) => {
-                command.push(c);
-                term.write_str(&c.to_string())?;
+                match curr_area {
+                    CurrentArea::Command => {
+                        command.push(c);
+                        term.write_str(&c.to_string())?;
+                    }
+                    _ => {
+                        match c {
+                            'w' | 'W' => {}, // current area.y -= 1
+                            'a' | 'A' => {},
+                            's' | 'S' => {},
+                            'd' | 'D' => {},
+                            _ => {},
+                        }
+                    }
+                }
             },
             Enter => {
                 if command == "q" {
@@ -257,52 +465,58 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn load_dirs(curr_dir: &mut Directory, dir_path: &Path) -> io::Result<()> {
+fn load_dir(dir_path: &Path) -> io::Result<Directory> {
+    let mut directories: Vec<Directory> = vec![];
+    let mut files: Vec<FileInfo> = vec![];
+
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
-
-        let name: OsString = entry.file_name();
-        let path: PathBuf = entry.path();
-        let meta: fs::Metadata = entry.metadata()?;
-
+        
         if entry.file_type()?.is_dir() {
-            let mut new_dir = Directory {
-                name,
-                files: vec![],
-                directories: vec![],
-            };
-            load_dirs(&mut new_dir, &path)?;
-
-            curr_dir.directories.push(new_dir);
+            directories.push(load_dir(&entry.path())?);
         } else {
-            curr_dir.files.push(File { name, meta });
+            files.push(FileInfo { name: entry.file_name(), meta: entry.metadata()? });
         }
     }
 
-    Ok(())
+    Ok(Directory {
+        name: dir_path.file_name().unwrap().to_os_string(),
+        meta: dir_path.metadata()?,
+        directories,
+        files
+    })
 }
 
-// fn draw(term: &Term, manager: &TerminalManager) {
-    
-// }
-
-fn draw_arrows(term: &Term, begin: Vector2, arrow: &str, mov_x: i8, mov_y: i8) -> io::Result<()>
-{
-    let mut pos = begin;
-    term.move_cursor_to(begin.x, begin.y)?;
-    for _ in 0..11 {
-        term.write_str(arrow)?;
-        term.move_cursor_left(1)?;
-        pos.x = pos.x.wrapping_add(mov_x as usize);
-        pos.y = pos.y.wrapping_add(mov_y as usize);
-        //mov()?;
-        term.move_cursor_to(pos.x, pos.y)?;
+fn print_to_area(term: &Term, bounds: &ScrollableArea, text: &str, color: Style, pos: Vector2) -> io::Result<()> {
+    #[derive(Clone, Copy)]
+    enum Direction {
+        Up,
+        Right,
+        Down,
+        Left,
     }
-    Ok(())
-}
 
-fn print_if_in_bounds(term: &Term, bounds: &ScrollableArea, text: &str, pos: Vector2) -> io::Result<()> {
-    let actual_pos = pos - bounds.curr_pos;
+    let draw_arrows = |direction| -> io::Result<()> {
+        let (arrow, plus_x, plus_y, begin_offset, count): (_, isize, isize, _, _) = match direction {
+            Direction::Up => ("↑", 1, 0, Vector2 { x: 0, y: 0 }, bounds.size.x),
+            Direction::Right => ("→", 0, 1, Vector2 { x: bounds.size.x - 1, y: 0 }, bounds.size.y),
+            Direction::Down => ("↓", -1, 0, Vector2 { x: bounds.size.x - 1, y: bounds.size.y }, bounds.size.x),
+            Direction::Left => ("←", 0, -1, Vector2 { x: 0, y: bounds.size.y }, bounds.size.y),
+        };
+
+        let mut pos = bounds.screen_offset + begin_offset;
+        for _ in 0..count {
+            term.move_cursor_to(pos.x, pos.y)?;
+            term.write_str(arrow)?;
+            term.move_cursor_left(1)?;
+
+            pos.x = pos.x.wrapping_add(plus_x as usize);
+            pos.y = pos.y.wrapping_add(plus_y as usize);
+        }
+        Ok(())
+    };
+
+    let actual_pos = pos + bounds.screen_offset - bounds.curr_pos;
 
     let low_bound = bounds.screen_offset;
     let high_bound = bounds.screen_offset + bounds.size;
@@ -313,23 +527,19 @@ fn print_if_in_bounds(term: &Term, bounds: &ScrollableArea, text: &str, pos: Vec
     let in_bounds_left = actual_pos.x >= low_bound.x;
     
     if !in_bounds_top {
-        draw_arrows(term, bounds.screen_offset + Vector2 { x: (bounds.size.x / 2) - 5, y: 0 },
-            "↑", 1, 0)?;//|| { term.move_cursor_right(1) })?;
+        draw_arrows(Direction::Up)?;
     }
 
     if !in_bounds_right {
-        draw_arrows(term, bounds.screen_offset + Vector2 { x: bounds.size.x, y: (bounds.size.y / 2) - 5 },
-            "→", 0, 1)?;//|| { term.move_cursor_down(1) })?;
+        draw_arrows(Direction::Right)?;
     }
 
     if !in_bounds_bot {
-        draw_arrows(term, bounds.screen_offset + Vector2 { x: (bounds.size.x / 2) + 5, y: bounds.size.y },
-            "↓", -1, 0)?;//|| { term.move_cursor_left(1) })?;
+        draw_arrows(Direction::Down)?;
     }
 
     if !in_bounds_left {
-        draw_arrows(term, bounds.screen_offset + Vector2 { x: 0, y: (bounds.size.y / 2) + 5 },
-            "←", 0, -1)?;//|| { term.move_cursor_up(1) })?;
+        draw_arrows(Direction::Left)?;
     }
 
     // TODO
@@ -345,78 +555,8 @@ fn print_if_in_bounds(term: &Term, bounds: &ScrollableArea, text: &str, pos: Vec
             text = &text[..high_bound.x-actual_pos.x];
         }
         term.move_cursor_to(begin_x, actual_pos.y)?;
-        term.write_str(text)?;
+        term.write_str(&format!("{}", color.apply_to(text)))?;
     }
 
     Ok(())
-}
-
-fn draw_tree(manager: &TerminalManager, curr_dir: &Directory, curr_dir_pos: &mut Vector2) -> io::Result<()> {
-    let term = &manager.term;
-    let tree_area = &manager.tree_area;
-
-    let begin_pos = *curr_dir_pos;
-
-    print_if_in_bounds(term, tree_area, curr_dir.name.to_str().unwrap(), begin_pos)?;
-
-    let dirs = &curr_dir.directories;
-    for (i, dir) in dirs.iter().enumerate() {
-        curr_dir_pos.x = begin_pos.x + 3;
-        curr_dir_pos.y += 1;
-
-        let to_print = if i == dirs.len() - 1 {
-            "└─" // U+2514 U+2500
-        } else {
-            "├─" // U+251C U+2500
-        };
-
-        print_if_in_bounds(term, tree_area, to_print, Vector2 { x: begin_pos.x, y: curr_dir_pos.y })?;
-        
-        let init_y = begin_pos.y;
-        draw_tree(manager, dir, curr_dir_pos)?;
-
-        for i in init_y+1..curr_dir_pos.y {
-            print_if_in_bounds(term, tree_area, "|", Vector2 { x: begin_pos.x, y: i })?;
-        }
-    }
-
-    Ok(())
-}
-
-fn draw_contents(manager: &TerminalManager, curr_dir: &Directory) -> io::Result<()> {
-    Ok(())
-}
-
-fn draw_outline(height: usize, width: usize) {
-    let line_x = (width as f64 * 0.6) as usize;
-
-    println!("DirMan");
-    print!("+");
-    for _ in 1..line_x {
-        print!("-");
-    }
-    print!("+");
-    for _ in line_x+1..width-1 {
-        print!("-");
-    }
-    println!("+");
-    
-    for _ in 0..height-4 {
-        for _ in 0..line_x {
-            print!(" ");
-        }
-        println!("|");
-    }
-
-    print!("+");
-    for _ in 1..line_x {
-        print!("-");
-    }
-    print!("+");
-    for _ in line_x+1..width-1 {
-        print!("-");
-    }
-    println!("+");
-    print!(" > ");
-    io::stdout().flush().unwrap();
 }
