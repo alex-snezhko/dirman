@@ -58,23 +58,33 @@ struct Directory {
     directories: Vec<Directory>,
 }
 
+struct ColoredString {
+    string: String,
+    color: Style,
+}
+
 struct ScrollableArea {
     screen_offset: Vector2,  // the location on the terminal window of the top left of this area
-    size: Vector2,           // the size of the area where content may be drawn (not including border)
+    size: Vector2,           // the size of the area
     curr_pos: Vector2,       // current offset into the content
     contents: Vec<String>,   // buffer of all contents that can be printed in this area
-    longest_line_len: usize,       // cache: length of longest line in contents
+    longest_line_len: usize, // cache: length of longest line in contents
 }
 
 impl ScrollableArea {
+    fn contents_size(&self) -> Vector2 {
+        self.size - Vector2 { x: 4, y: 2 }
+    }
+
     fn draw(&self, term: &Term) -> io::Result<()> {
         #[derive(Clone, Copy)]
-        enum Direction {
-            Up,
+        enum ArrowLocation {
+            Top,
             Right,
-            Down,
+            Bottom,
             Left,
         }
+        let contents_size = self.contents_size();
 
         // clear the panel
         // let end_x = self.screen_offset.x + self.size.x + 4;
@@ -82,31 +92,28 @@ impl ScrollableArea {
         //     term.move_cursor_to(end_x, self.screen_offset.y + y)?;
         //     term.clear_chars(self.size.x + 4)?;
         // }
-        for y in 0..self.size.y+2 {
+        for y in 0..self.size.y {
             term.move_cursor_to(self.screen_offset.x, self.screen_offset.y + y)?;
-            for _ in 0..self.size.x+4 {
+            for _ in 0..self.size.x {
                 term.write_str(" ")?;
             }
         }
 
         // closure for drawing arrows in specified direction
         let draw_arrows = |direction| -> io::Result<()> {
-            use Direction::*;
-            let (arrow, horizontal) = match direction {
-                Up => ("↑", true),
-                Right => ("→", false),
-                Down => ("↓", true),
-                Left => ("←", false),
-            };
+            // bounds that arrows may be drawn in will be 1 unit away from edges
+            let s = self.size - Vector2 { x: 2, y: 2 };
 
-            let (begin_offset, count) = if horizontal {
-                let middle = (self.size.x + 4) / 2;
-                let begin = middle - (middle / 4) * 4;
-                (self.screen_offset + Vector2 { x: begin, y: 0 }, middle * 2)
-            } else {
-                let middle = (self.size.y + 2) / 2;
-                let begin = middle - (middle / 2) * 2;
-                (self.screen_offset + Vector2 { x: 0, y: begin }, middle * 2)
+            use ArrowLocation::*;
+            // begin_offset determines where to place the terminal cursor for the first arrow
+            // in the sequence; it is calculated by the principle that as many arrows should be
+            // drawn as can fit in the bounds; the complex calculation involves finding the size of
+            // the "line" of arrows to be drawn (including one extra as fence-post) and centering it
+            let (arrow, horizontal, begin_offset, count) = match direction {
+                Top => ("↑", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / 4) * 4 + 1)) / 2, y: 0 }, (s.x - 1) / 4 + 1),
+                Right => ("→", false, Vector2 { x: s.x + 1, y: 1 + (s.y - (((s.y - 1) / 2) * 2 + 1)) / 2 }, (s.y - 1) / 2 + 1),
+                Bottom =>  ("↓", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / 4) * 4 + 1)) / 2, y: s.y + 1 }, (s.x - 1) / 4 + 1),
+                Left => ("←", false, Vector2 { x: 0, y: 1 + (s.y - (((s.y - 1) / 2) * 2 + 1)) / 2 }, (s.y - 1) / 2 + 1),
             };
 
             let mut pos = self.screen_offset + begin_offset;
@@ -144,24 +151,24 @@ impl ScrollableArea {
         };
         
         if self.curr_pos.y > 0 {
-            draw_arrows(Direction::Up)?;
+            draw_arrows(ArrowLocation::Top)?;
         }
 
-        if self.size.x + self.curr_pos.x < self.longest_line_len {
-            draw_arrows(Direction::Right)?;
+        if contents_size.x + self.curr_pos.x < self.longest_line_len {
+            draw_arrows(ArrowLocation::Right)?;
         }
 
-        if self.size.y + self.curr_pos.y < self.contents.len() {
-            draw_arrows(Direction::Down)?;
+        if contents_size.y + self.curr_pos.y < self.contents.len() {
+            draw_arrows(ArrowLocation::Bottom)?;
         }
 
         if self.curr_pos.x > 0 {
-            draw_arrows(Direction::Left)?;
+            draw_arrows(ArrowLocation::Left)?;
         }
 
-        for i in 0..self.size.y {
+        for i in 0..contents_size.y {
             let to_print: String = match self.contents.get(self.curr_pos.y + i) {
-                Some(s) => s.chars().skip(self.curr_pos.x).take(self.size.x).collect(),
+                Some(s) => s.chars().skip(self.curr_pos.x).take(contents_size.x).collect(),
                 None => break,
             };
 
@@ -172,14 +179,6 @@ impl ScrollableArea {
         Ok(())
     }
 }
-
-// #[derive(Clone, Copy)]
-// enum Which { Command, Tree, Contents }
-
-// struct CurrentArea {
-//     which: Which,
-//     area: ScrollableArea,
-// }
 
 #[derive(Clone, Copy, PartialEq)]
 enum CurrentArea { Command, Tree, Contents }
@@ -433,7 +432,7 @@ fn main() -> io::Result<()> {
     let tree_contents = load_tree(&root, &vec![], &mut 0, &root);
     let mut tree_area = ScrollableArea {
         screen_offset: Vector2 { x: 0, y: 2 },
-        size: Vector2 { x: line_x - 4, y: size.y - 6 },
+        size: Vector2 { x: line_x, y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
         longest_line_len: tree_contents.iter().fold(0, |largest, x| max(largest, x.chars().count())),
         contents: tree_contents,
@@ -442,7 +441,7 @@ fn main() -> io::Result<()> {
     let dir_contents = load_contents(&root);
     let mut contents_area = ScrollableArea {
         screen_offset: Vector2 { x: line_x + 1, y: 2 },
-        size: Vector2 { x: (size.x - line_x - 1) - 4, y: size.y - 6 },
+        size: Vector2 { x: (size.x - line_x - 1), y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
         longest_line_len: dir_contents.iter().fold(0, |largest, x| max(largest, x.chars().count())),
         contents: dir_contents,
@@ -520,15 +519,15 @@ fn main() -> io::Result<()> {
                             curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
                             curr_area.draw(&term)?;
                         },
-                        's' | 'S' => if curr_area.size.y + curr_area.curr_pos.y < curr_area.contents.len() {
+                        's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
                             curr_area.curr_pos.y += min(
-                                curr_area.contents.len() - curr_area.size.y,
+                                curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
                                 5);
                             curr_area.draw(&term)?;
                         },
-                        'd' | 'D' => if curr_area.size.x + curr_area.curr_pos.x < curr_area.longest_line_len {
+                        'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
                             curr_area.curr_pos.x += min(
-                                curr_area.longest_line_len - curr_area.size.x,
+                                curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
                                 5);
                             curr_area.draw(&term)?;
                         },
