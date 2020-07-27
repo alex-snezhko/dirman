@@ -60,14 +60,24 @@ struct Directory {
 
 struct ColoredString {
     string: String,
-    color: Style,
+    color: Option<Style>,
+}
+
+impl ColoredString {
+    fn normal(string: String) -> Self {
+        Self { string, color: None }
+    }
+
+    fn colored(string: String, color: Style) -> Self {
+        Self { string, color: Some(color) }
+    }
 }
 
 struct ScrollableArea {
     screen_offset: Vector2,  // the location on the terminal window of the top left of this area
     size: Vector2,           // the size of the area
     curr_pos: Vector2,       // current offset into the content
-    contents: Vec<String>,   // buffer of all contents that can be printed in this area
+    contents: Vec<Vec<ColoredString>>,   // buffer of all contents that can be printed in this area
     longest_line_len: usize, // cache: length of longest line in contents
 }
 
@@ -87,11 +97,6 @@ impl ScrollableArea {
         let contents_size = self.contents_size();
 
         // clear the panel
-        // let end_x = self.screen_offset.x + self.size.x + 4;
-        // for y in 0..self.size.y+2 {
-        //     term.move_cursor_to(end_x, self.screen_offset.y + y)?;
-        //     term.clear_chars(self.size.x + 4)?;
-        // }
         for y in 0..self.size.y {
             term.move_cursor_to(self.screen_offset.x, self.screen_offset.y + y)?;
             for _ in 0..self.size.x {
@@ -128,26 +133,6 @@ impl ScrollableArea {
                 }
             }
             Ok(())
-
-
-            // use Direction::*;
-            // let (arrow, plus_x, plus_y, begin_offset, count): (_, isize, isize, _, _) = match direction {
-            //     Up => ("↑", 4, 0, Vector2 { x: 0, y: 0 }, self.size.x / 4),
-            //     Right => ("→", 0, 2, Vector2 { x: self.size.x + 3, y: 0 }, self.size.y / 2),
-            //     Down => ("↓", -4, 0, Vector2 { x: self.size.x + 3, y: self.size.y + 1 }, self.size.x / 4),
-            //     Left => ("←", 0, -2, Vector2 { x: 0, y: self.size.y + 1 }, self.size.y / 2),
-            // };
-
-            // let mut pos = self.screen_offset + begin_offset;
-            // for _ in 0..count {
-            //     term.move_cursor_to(pos.x, pos.y)?;
-            //     term.write_str(arrow)?;
-            //     term.move_cursor_left(1)?;
-
-            //     pos.x = pos.x.wrapping_add(plus_x as usize);
-            //     pos.y = pos.y.wrapping_add(plus_y as usize);
-            // }
-            // Ok(())
         };
         
         if self.curr_pos.y > 0 {
@@ -167,13 +152,46 @@ impl ScrollableArea {
         }
 
         for i in 0..contents_size.y {
-            let to_print: String = match self.contents.get(self.curr_pos.y + i) {
-                Some(s) => s.chars().skip(self.curr_pos.x).take(contents_size.x).collect(),
-                None => break,
-            };
+            if let Some(line) = self.contents.get(self.curr_pos.y + i) {
+                term.move_cursor_to(self.screen_offset.x + 2, self.screen_offset.y + 1 + i)?;
 
-            term.move_cursor_to(self.screen_offset.x + 2, self.screen_offset.y + 1 + i)?;
-            term.write_str(&to_print)?;
+                let mut piece_begin = 0;
+                for piece in line {
+                    
+                    let len = piece.string.chars().count();
+                    if piece_begin + len < self.curr_pos.x {
+                        piece_begin += len;
+                        continue;
+                    }
+
+                    let skip = match self.curr_pos.x.checked_sub(piece_begin) {
+                        Some(i) => i,
+                        None => 0,
+                    };
+                    let take = contents_size.x - ((piece_begin + skip) - self.curr_pos.x);
+
+                    let substr: String = piece.string.chars().skip(skip).take(take).collect();
+                    let len = substr.chars().count();
+
+                    term.write_str(&if let Some(color) = &piece.color {
+                        format!("{}", color.apply_to(substr))
+                    } else {
+                        substr
+                    })?;
+
+                    piece_begin += skip + len;
+                    
+                    //term.write_str(&to_print)?;
+                }
+                
+                
+                //s.chars().skip(self.curr_pos.x).take(contents_size.x).collect()
+            } else {
+                break;
+            }
+
+            // term.move_cursor_to(self.screen_offset.x + 2, self.screen_offset.y + 1 + i)?;
+            // term.write_str(&to_print)?;
         }
 
         Ok(())
@@ -183,7 +201,15 @@ impl ScrollableArea {
 #[derive(Clone, Copy, PartialEq)]
 enum CurrentArea { Command, Tree, Contents }
 
-fn process_command(root: &Directory, command: &str) {
+// struct StateManager<'a> {
+//     term: &'a Term,
+//     root: &'a Directory,
+//     curr_dir: &'a Directory,
+//     tree: &'a ScrollableArea,
+//     dir_contents: &'a ScrollableArea,
+// }
+
+fn process_command(command: &str, root: &Directory, tree: &ScrollableArea, dir_contents: &ScrollableArea) {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.len() == 0 {
         return;
@@ -207,15 +233,17 @@ fn process_command(root: &Directory, command: &str) {
         "rename" => {},
         "copy" => {},
         "new" => {},
+        "select" => {},
         _ => {},
     }
 }
 
-// fn highlight_if_multiple(&self, dirs: &Vec<&'a Directory>) {
-//     if dirs.len() > 1 {
-//         //self.draw_tree(dirs, &mut 1, self.root, &mut Vector2 { x: 0, y: 0 });
-//     }
-// }
+fn highlight_if_multiple(tree: &ScrollableArea, dirs: &Vec<&'a Directory>) {
+    if dirs.len() > 1 {
+        load_tree(selected_dir: &Directory, selected_dirs: &Vec<&Directory>, selected_dir_num: &mut i32, curr_dir: &Directory)
+        tree.draw(dirs, &mut 1, self.root, &mut Vector2 { x: 0, y: 0 });
+    }
+}
 
 fn to_directory<'a>(root: &'a Directory, path: &str) -> Vec<&'a Directory> {
     let parts: Vec<&str> = path.split("/").collect();
@@ -245,20 +273,20 @@ fn to_directory_helper<'a>(path: &str, curr_dir: &'a Directory, possible: &mut V
 //     //fs::
 // }
 
-fn draw_outline(term: &Term, panel: CurrentArea) -> io::Result<()> {
+fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     let (height, width) = {
         let size = term.size();
         (size.0 as usize, size.1 as usize)
     };
 
-    let line_x = (width as f64 * 0.6) as usize;
+    let line_x = (width as f64 * 0.5) as usize;
 
     term.move_cursor_to(0, 0)?;
     term.write_line("DirMan")?;
 
     let red = Style::new().red();
     let print_with_color = |text: &str, colored_list: Vec<CurrentArea>| -> io::Result<()> {
-        let colored = if colored_list.contains(&panel) {
+        let colored = if colored_list.contains(&selected_panel) {
             format!("{}", red.apply_to(text))
         } else {
             text.to_string()
@@ -276,14 +304,12 @@ fn draw_outline(term: &Term, panel: CurrentArea) -> io::Result<()> {
     for _ in line_x+1..width {
         print_with_color("━", vec![Contents])?;
     }
-    term.write_line("")?;
+    term.move_cursor_down(1)?;
     
     for _ in 0..height-4 {
-        for _ in 0..line_x {
-            term.move_cursor_right(line_x)?;
-        }
+        term.move_cursor_right(line_x)?;
         print_with_color("┃", vec![Tree, Contents])?;
-        term.write_line("")?;
+        term.move_cursor_down(1)?;
     }
 
     for _ in 0..line_x {
@@ -306,26 +332,26 @@ fn load_tree(
     selected_dirs: &Vec<&Directory>,
     selected_dir_num: &mut i32, // counter for when multiple directories are selected, to display each with own number
     curr_dir: &Directory,    // current dir being processed
-) -> Vec<String>
+) -> Vec<Vec<ColoredString>>
 {
     let mut contents = vec![];
 
-    let curr_dir_name: &str = curr_dir.name.to_str().unwrap();
+    let curr_dir_name: String = curr_dir.name.clone().into_string().unwrap();
 
     // print item with correct color
-    contents.push(
+    contents.push(vec![
         if selected_dirs.iter().any(|&e| e as *const Directory == curr_dir as *const Directory) {
             // print a selected item in red
             let text = format!("{}: {}", curr_dir_name, selected_dir_num);
             *selected_dir_num += 1;
-            format!("{}", Style::new().red().apply_to(text))
+            ColoredString::colored(text, Style::new().red())
         } else if curr_dir as *const Directory == selected_dir as *const Directory {
             // print current directory in blue
-            format!("{}", Style::new().blue().apply_to(curr_dir_name))
+            ColoredString::colored(curr_dir_name, Style::new().blue())
         } else {
             // otherwise print normally
-            curr_dir_name.to_string()
-        });
+            ColoredString::normal(curr_dir_name)
+        }]);
 
     // iterate through all child directories and load them as well
     let dirs = &curr_dir.directories;
@@ -338,46 +364,52 @@ fn load_tree(
         };
 
         let inner_dir_content = load_tree(selected_dir, selected_dirs, selected_dir_num, dir);
-        for i in 0..inner_dir_content.len() {
-            contents.push(String::from(if i == 0 { begin } else { next }) + &inner_dir_content[i]);
+
+        let mut first = true;
+        for e in inner_dir_content {
+            let mut line = vec![ColoredString::normal(if first { first = false; begin } else { next }.to_string())];
+            for piece in e {
+                line.push(piece);
+            }
+            contents.push(line);
         }
     }
 
     contents
 }
 
-fn load_contents(curr_dir: &Directory) -> Vec<String> {
+fn load_contents(curr_dir: &Directory) -> Vec<Vec<ColoredString>> {
     let mut contents = vec![];
 
-    contents.push("Last Modified           Size  Name".to_string());
-    contents.push("-------------           ----  ----".to_string());
+    contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
+    contents.push(vec![ColoredString::normal("-------------           ----  ----".to_string())]);
     if curr_dir.directories.len() != 0 {
-        contents.push("- Directories -".to_string());
+        contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
 
         for dir in &curr_dir.directories {
             let last_mod = DateTime::<Utc>::from(dir.meta.modified().unwrap());
 
             let (pm, hour) = last_mod.hour12();
-            contents.push(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
+            contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
                 last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
                 hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
-                dir.name.to_str().unwrap()));                            // file name
+                dir.name.to_str().unwrap()))]);                            // file name
         }
-        contents.push(String::new());
+        contents.push(vec![ColoredString::normal(String::new())]);
     }
 
     if curr_dir.files.len() != 0 {
-        contents.push("- Files -".to_string());
+        contents.push(vec![ColoredString::normal("- Files -".to_string())]);
 
         for file in &curr_dir.files {
             let last_mod = DateTime::<Utc>::from(file.meta.modified().unwrap());
 
             let (pm, hour) = last_mod.hour12();
-            contents.push(format!("{:02}/{:02}/{:02} {:02}:{:02} {}  {:>7}  {}",
+            contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}  {:>7}  {}",
                 last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
                 hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
                 file_size_to_str(file.meta.file_size()),                 // file size string
-                file.name.to_str().unwrap()));                           // file name
+                file.name.to_str().unwrap()))]);                           // file name
         }
     }
 
@@ -427,14 +459,16 @@ fn main() -> io::Result<()> {
 
     let curr_dir = &root;
 
-    let line_x = (size.x as f64 * 0.6) as usize;
+    let line_x = (size.x as f64 * 0.5) as usize;
 
     let tree_contents = load_tree(&root, &vec![], &mut 0, &root);
     let mut tree_area = ScrollableArea {
         screen_offset: Vector2 { x: 0, y: 2 },
         size: Vector2 { x: line_x, y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
-        longest_line_len: tree_contents.iter().fold(0, |largest, x| max(largest, x.chars().count())),
+        longest_line_len: tree_contents.iter()
+            .fold(0, |largest, line| max(largest, line.iter()
+                .fold(0, |len, piece| len + piece.string.chars().count()))),
         contents: tree_contents,
     };
 
@@ -443,7 +477,9 @@ fn main() -> io::Result<()> {
         screen_offset: Vector2 { x: line_x + 1, y: 2 },
         size: Vector2 { x: (size.x - line_x - 1), y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
-        longest_line_len: dir_contents.iter().fold(0, |largest, x| max(largest, x.chars().count())),
+        longest_line_len: dir_contents.iter()
+            .fold(0, |largest, line| max(largest, line.iter()
+                .fold(0, |acc, piece| acc + piece.string.chars().count()))),
         contents: dir_contents,
     };
 
@@ -468,6 +504,8 @@ fn main() -> io::Result<()> {
 
     let mut curr_area = &mut command_area;
     let mut curr_area_tag = CurrentArea::Command;
+
+    process_command(&root, "enter dir1");
     
     let mut command = String::new();
     loop {
