@@ -249,10 +249,11 @@ impl<'a> StateManager<'a> {
                 if possible_dirs.len() > 1 {
                     self.ambiguous_dirs = possible_dirs;
                 } else {
-                    self.hidden_dirs.push(possible_dirs[0]);
-                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                    self.tree.draw(self.term).unwrap();
-                    
+                    if !self.hidden_dirs.contains(&possible_dirs[0]) {
+                        self.hidden_dirs.push(possible_dirs[0]);
+                        self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                        self.tree.draw(self.term).unwrap();
+                    }
                 }
             },
             "open" => {
@@ -263,10 +264,11 @@ impl<'a> StateManager<'a> {
                 if possible_dirs.len() > 1 {
                     self.ambiguous_dirs = possible_dirs;
                 } else {
-                    // TODO self.hidden_dirs.remove_item(possible_dirs[0]);
-                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                    self.tree.draw(self.term).unwrap();
-                    
+                    if let Some(index) = self.hidden_dirs.iter().position(|&e| e == possible_dirs[0]) {
+                        self.hidden_dirs.remove(index);
+                        self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                        self.tree.draw(self.term).unwrap();
+                    }
                 }
             },
             "move" => {
@@ -555,6 +557,7 @@ fn main() -> io::Result<()> {
         root: &root,
         curr_dir: &root,
         hidden_dirs: vec![],
+        ambiguous_dirs: vec![],
         tree: tree_area,
         dir_contents: contents_area,
     };
@@ -569,13 +572,8 @@ fn main() -> io::Result<()> {
     manager.dir_contents.draw(&term)?;
 
     term.move_cursor_to(3, size.y - 1)?;
-    term.move_cursor_to(0, 0)?;
-    //term.write_str("asdf");
 
     let mut curr_area_tag = CurrentArea::Command;
-
-    manager.process_command("enter dir1")?;
-    manager.process_command("close dir2")?;
     
     let mut command = String::new();
     loop {
@@ -650,7 +648,11 @@ fn main() -> io::Result<()> {
                 if command == "q" {
                     break;
                 }
-                manager.process_command(&command);
+                manager.process_command(&command)?;
+                let chars = command.chars().count();
+                term.move_cursor_right(chars)?;
+                term.clear_chars(command.chars().count())?;
+                command.clear();
             }
             Backspace => {
                 command.pop();
