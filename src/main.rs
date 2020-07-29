@@ -5,9 +5,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Sub};
-use std::cmp::{max, min};
+use std::cmp::{PartialEq, max, min};
 use console::{Term, Style};
 use chrono::{DateTime, Utc, Datelike, Timelike};
+use colorful::Color;
+use colorful::Colorful;
+use colorful::RGB;
 
 #[derive(Debug, Clone, Copy)]
 struct Vector2 {
@@ -58,9 +61,15 @@ struct Directory {
     directories: Vec<Directory>,
 }
 
+impl PartialEq for Directory {
+    fn eq(&self, other: &Self) -> bool {
+        self as *const Directory == other as *const Directory
+    }
+}
+
 struct ColoredString {
     string: String,
-    color: Option<Style>,
+    color: Option<Color>,
 }
 
 impl ColoredString {
@@ -68,7 +77,7 @@ impl ColoredString {
         Self { string, color: None }
     }
 
-    fn colored(string: String, color: Style) -> Self {
+    fn colored(string: String, color: Color) -> Self {
         Self { string, color: Some(color) }
     }
 }
@@ -174,7 +183,7 @@ impl ScrollableArea {
                     let len = substr.chars().count();
 
                     term.write_str(&if let Some(color) = &piece.color {
-                        format!("{}", color.apply_to(substr))
+                        format!("{}", substr.color(*color))//color.apply_to(substr))
                     } else {
                         substr
                     })?;
@@ -201,48 +210,92 @@ impl ScrollableArea {
 #[derive(Clone, Copy, PartialEq)]
 enum CurrentArea { Command, Tree, Contents }
 
-// struct StateManager<'a> {
-//     term: &'a Term,
-//     root: &'a Directory,
-//     curr_dir: &'a Directory,
-//     tree: &'a ScrollableArea,
-//     dir_contents: &'a ScrollableArea,
-// }
-
-fn process_command(command: &str, root: &Directory, tree: &ScrollableArea, dir_contents: &ScrollableArea) {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    if tokens.len() == 0 {
-        return;
-    }
-
-    match tokens[0] {
-        "enter" => {
-            if tokens.len() > 2 {
-                //print_error("'enter' command must be followed by a directory");
-            }
-            let possible_dirs = to_directory(root, tokens[1]);
-            //Self::highlight_if_multiple(&possible_dirs);
-        },
-        "close" => {},
-        "open" => {},
-        "move" => {
-            if tokens.len() > 2 {
-                //print_error("'enter' command must be followed by a directory");
-            }
-        },
-        "rename" => {},
-        "copy" => {},
-        "new" => {},
-        "select" => {},
-        _ => {},
-    }
+struct StateManager<'a> {
+    term: &'a Term,
+    root: &'a Directory,
+    curr_dir: &'a Directory,
+    hidden_dirs: Vec<&'a Directory>,
+    ambiguous_dirs: Vec<&'a Directory>,
+    tree: ScrollableArea,
+    dir_contents: ScrollableArea,
 }
 
-fn highlight_if_multiple(tree: &ScrollableArea, dirs: &Vec<&'a Directory>) {
-    if dirs.len() > 1 {
-        load_tree(selected_dir: &Directory, selected_dirs: &Vec<&Directory>, selected_dir_num: &mut i32, curr_dir: &Directory)
-        tree.draw(dirs, &mut 1, self.root, &mut Vector2 { x: 0, y: 0 });
+impl<'a> StateManager<'a> {
+
+    fn process_command(&mut self, command: &str) -> io::Result<()> {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        if tokens.len() == 0 {
+            return Ok(());
+        }
+
+        match tokens[0] {
+            "enter" => {
+                if tokens.len() > 2 {
+                    //print_error("'enter' command must be followed by a directory");
+                }
+                let possible_dirs = to_directory(self.root, tokens[1]);
+                if possible_dirs.len() > 1 {
+                    self.ambiguous_dirs = possible_dirs;
+                } else {
+                    self.tree.contents = load_tree(possible_dirs[0], &vec![], &self.hidden_dirs, &mut 0, self.root);
+                    self.tree.draw(self.term).unwrap();
+                }
+            },
+            "close" => {
+                if tokens.len() > 2 {
+                    //print_error("'close' command must be followed by a directory");
+                }
+                let possible_dirs = to_directory(self.root, tokens[1]);
+                if possible_dirs.len() > 1 {
+                    self.ambiguous_dirs = possible_dirs;
+                } else {
+                    self.hidden_dirs.push(possible_dirs[0]);
+                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                    self.tree.draw(self.term).unwrap();
+                    
+                }
+            },
+            "open" => {
+                if tokens.len() > 2 {
+                    //print_error("'close' command must be followed by a directory");
+                }
+                let possible_dirs = to_directory(self.root, tokens[1]);
+                if possible_dirs.len() > 1 {
+                    self.ambiguous_dirs = possible_dirs;
+                } else {
+                    // TODO self.hidden_dirs.remove_item(possible_dirs[0]);
+                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                    self.tree.draw(self.term).unwrap();
+                    
+                }
+            },
+            "move" => {
+                if tokens.len() > 2 {
+                    //print_error("'enter' command must be followed by a directory");
+                }
+            },
+            "rename" => {},
+            "copy" => {},
+            "new" => {},
+            "select" => {},
+            _ => {},
+        }
+
+        self.term.move_cursor_to(3, self.term.size().0 as usize - 1)?;
+        Ok(())
     }
+
+    fn highlight_if_multiple(&self, dirs: &Vec<&'a Directory>) -> io::Result<()> {
+        if dirs.len() > 1 {
+            load_tree(self.curr_dir, &vec![], dirs, &mut 0, self.root);
+            self.tree.draw(self.term)?;
+        }
+        self.term.move_cursor_to(0, 0)?;
+        //print_error(self.term.write_str("Ambiguous file/directory; input number of intended choice")?;
+
+        Ok(())
+    }
+
 }
 
 fn to_directory<'a>(root: &'a Directory, path: &str) -> Vec<&'a Directory> {
@@ -329,7 +382,8 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
 
 fn load_tree(
     selected_dir: &Directory,
-    selected_dirs: &Vec<&Directory>,
+    ambiguous_dirs: &Vec<&Directory>,
+    hidden_dirs: &Vec<&Directory>,
     selected_dir_num: &mut i32, // counter for when multiple directories are selected, to display each with own number
     curr_dir: &Directory,    // current dir being processed
 ) -> Vec<Vec<ColoredString>>
@@ -338,20 +392,25 @@ fn load_tree(
 
     let curr_dir_name: String = curr_dir.name.clone().into_string().unwrap();
 
+    let mut hidden = false;
     // print item with correct color
     contents.push(vec![
-        if selected_dirs.iter().any(|&e| e as *const Directory == curr_dir as *const Directory) {
-            // print a selected item in red
+        if ambiguous_dirs.iter().any(|&e| e == curr_dir) {   // red
             let text = format!("{}: {}", curr_dir_name, selected_dir_num);
             *selected_dir_num += 1;
-            ColoredString::colored(text, Style::new().red())
-        } else if curr_dir as *const Directory == selected_dir as *const Directory {
-            // print current directory in blue
-            ColoredString::colored(curr_dir_name, Style::new().blue())
-        } else {
-            // otherwise print normally
+            ColoredString::colored(text, Color::Red)
+        } else if hidden_dirs.iter().any(|&e| e == curr_dir) {   // gray
+            hidden = true;
+            ColoredString::colored(format!("{} +", curr_dir_name), Color::DarkGray)
+        } else if curr_dir == selected_dir {   // blue
+            ColoredString::colored(curr_dir_name, Color::Blue)
+        } else {   // normal
             ColoredString::normal(curr_dir_name)
         }]);
+
+    if hidden {
+        return contents;
+    }
 
     // iterate through all child directories and load them as well
     let dirs = &curr_dir.directories;
@@ -363,7 +422,7 @@ fn load_tree(
             ("├─ ", "│  ")
         };
 
-        let inner_dir_content = load_tree(selected_dir, selected_dirs, selected_dir_num, dir);
+        let inner_dir_content = load_tree(selected_dir, ambiguous_dirs, hidden_dirs, selected_dir_num, dir);
 
         let mut first = true;
         for e in inner_dir_content {
@@ -461,8 +520,8 @@ fn main() -> io::Result<()> {
 
     let line_x = (size.x as f64 * 0.5) as usize;
 
-    let tree_contents = load_tree(&root, &vec![], &mut 0, &root);
-    let mut tree_area = ScrollableArea {
+    let tree_contents = load_tree(&root, &vec![], &vec![], &mut 0, &root);
+    let tree_area = ScrollableArea {
         screen_offset: Vector2 { x: 0, y: 2 },
         size: Vector2 { x: line_x, y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
@@ -473,7 +532,7 @@ fn main() -> io::Result<()> {
     };
 
     let dir_contents = load_contents(&root);
-    let mut contents_area = ScrollableArea {
+    let contents_area = ScrollableArea {
         screen_offset: Vector2 { x: line_x + 1, y: 2 },
         size: Vector2 { x: (size.x - line_x - 1), y: size.y - 4 },
         curr_pos: Vector2 { x: 0, y: 0 },
@@ -483,12 +542,21 @@ fn main() -> io::Result<()> {
         contents: dir_contents,
     };
 
-    let mut command_area = ScrollableArea {
+    let command_area = ScrollableArea {
         screen_offset: Vector2 { x: 3, y: size.y - 2 },
         size: Vector2 { x: size.x - 3, y: 1 },
         curr_pos: Vector2 { x: 0, y: 0 },
         contents: vec![],
         longest_line_len: 0,
+    };
+
+    let mut manager = StateManager {
+        term: &term,
+        root: &root,
+        curr_dir: &root,
+        hidden_dirs: vec![],
+        tree: tree_area,
+        dir_contents: contents_area,
     };
 
     for _ in 0..size.y {
@@ -497,25 +565,27 @@ fn main() -> io::Result<()> {
 
     draw_outline(&term, CurrentArea::Command)?;
 
-    tree_area.draw(&term)?;
-    contents_area.draw(&term)?;
+    manager.tree.draw(&term)?;
+    manager.dir_contents.draw(&term)?;
 
     term.move_cursor_to(3, size.y - 1)?;
+    term.move_cursor_to(0, 0)?;
+    //term.write_str("asdf");
 
-    let mut curr_area = &mut command_area;
     let mut curr_area_tag = CurrentArea::Command;
 
-    process_command(&root, "enter dir1");
+    manager.process_command("enter dir1")?;
+    manager.process_command("close dir2")?;
     
     let mut command = String::new();
     loop {
         let key = term.read_key()?;
 
+        // TODO handle resize https://docs.rs/crossterm/0.17.7/crossterm/event/fn.poll.html
         use console::Key::*;
         match key {
             ArrowUp => {
                 if let CurrentArea::Command = curr_area_tag {
-                    curr_area = &mut tree_area;
                     curr_area_tag = CurrentArea::Tree;
                     draw_outline(&term, CurrentArea::Tree)?;
                     term.hide_cursor()?;
@@ -523,14 +593,12 @@ fn main() -> io::Result<()> {
             },
             ArrowRight => {
                 if let CurrentArea::Tree = curr_area_tag {
-                    curr_area = &mut contents_area;
                     curr_area_tag = CurrentArea::Contents;
                     draw_outline(&term, CurrentArea::Contents)?;
                 }
             },
             ArrowDown | Escape => {
                 if curr_area_tag != CurrentArea::Command {
-                    curr_area = &mut command_area;
                     curr_area_tag = CurrentArea::Command;
                     draw_outline(&term, CurrentArea::Command)?;
                     term.show_cursor()?;
@@ -538,7 +606,6 @@ fn main() -> io::Result<()> {
             },
             ArrowLeft => {
                 if let CurrentArea::Contents = curr_area_tag {
-                    curr_area = &mut tree_area;
                     curr_area_tag = CurrentArea::Tree;
                     draw_outline(&term, CurrentArea::Tree)?;
                 }
@@ -548,6 +615,12 @@ fn main() -> io::Result<()> {
                     command.push(c);
                     term.write_str(&c.to_string())?;
                 } else {
+                    let curr_area = match curr_area_tag {
+                        CurrentArea::Tree => &mut manager.tree,
+                        CurrentArea::Contents => &mut manager.dir_contents,
+                        _ => &mut manager.tree,
+                    };
+
                     match c {
                         'w' | 'W' => if curr_area.curr_pos.y != 0 {
                             curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
@@ -577,7 +650,7 @@ fn main() -> io::Result<()> {
                 if command == "q" {
                     break;
                 }
-                process_command(&root, &command);
+                manager.process_command(&command);
             }
             Backspace => {
                 command.pop();
