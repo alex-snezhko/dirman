@@ -210,18 +210,25 @@ impl ScrollableArea {
 #[derive(Clone, Copy, PartialEq)]
 enum CurrentArea { Command, Tree, Contents }
 
-struct StateManager<'a> {
+type Ff<'a, 'b> = fn(&mut StateManager<'a, 'b>, Dir<'a, 'b>, &'b str) -> io::Result<()>;
+
+struct StateManager<'a, 'b> {
     term: &'a Term,
     root: &'a Directory,
     curr_dir: &'a Directory,
     hidden_dirs: Vec<&'a Directory>,
     ambiguous_dirs: Vec<&'a Directory>,
-    command_buf: Option<&'static str>,
+    command_buf: Option<(Ff<'a, 'b>, /*Dir<'a, 'b>, &'b str*/String)>,
     tree: ScrollableArea,
     dir_contents: ScrollableArea,
 }
 
-impl<'a> StateManager<'a> {
+enum Dir<'a, 'b> {
+    Disambiguated(&'a Directory),
+    Text(&'b str),
+}
+
+impl<'a, 'b> StateManager<'a, 'b> {
 
     fn process_command(&mut self, command: &str) -> io::Result<()> {
         let tokens: Vec<&str> = command.split_whitespace().collect();
@@ -229,155 +236,182 @@ impl<'a> StateManager<'a> {
             return Ok(());
         }
 
-        let mut command = tokens[0];
-        let mut unambiguous_dir = None;
-        if let Some(command_buf) = self.command_buf {
-            if tokens.len() != 1 {
-                print_error(self.term, "Input a single number for disambiguation or 'cancel' to cancel command");
-                return Ok(());
-            } else {
+        //let mut command = None;
+        if self.command_buf.is_some() {
+            // expect a single number
+            if tokens.len() == 1 {
                 if let Ok(num) = tokens[1].parse::<usize>() {
-                    command = command_buf;
-                    unambiguous_dir = self.ambiguous_dirs.get(num);
-                }
-                self.command_buf = None;
-            }
-        }
-        
-        let get_dir = |command_name, dir_name: Option<&&str>| -> Option<&&Directory> {
-            // if an ambiguity has just been resolved then this is the correct directory
-            if unambiguous_dir != None {
-                unambiguous_dir
-            } else {
-                // if the possible argument at the position given is valid then check
-                if let Some(dir_name) = dir_name {
-                    let possible_dirs = to_directory(self.root, dir_name);
-                    if possible_dirs.len() > 1 {
-                        self.ambiguous_dirs = possible_dirs;
-                        self.command_buf = Some(command_name);
-                        None
-                    } else {
-                        possible_dirs.get(0)
+                    if let Some(unambiguous_dir) = self.ambiguous_dirs.get(num) {
+                        if let Some(command) = &self.command_buf {
+                            //command.0(self, Dir::Disambiguated(*unambiguous_dir), &command.1);
+                        }
+                        self.command_buf = None;
                     }
-                } else {
-                    print_error(self.term, &format!("'{}' command must be followed by a directory", command_name));
-                    None
-                }
-            }
-        };
-
-        match command {
-            "enter" => {
-                if let Some(dir) = get_dir("enter", tokens.get(1)) {
-                    self.tree.contents = load_tree(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                    self.tree.draw(self.term)?;
+                } else if tokens[1] == "cancel" {
+                    self.ambiguous_dirs.clear();
                 }
                 
+            } else {
+                print_error(self.term, "Input a single number for disambiguation or 'cancel' to cancel command")?;
+                return Ok(());
+            }
+        }
 
-                // if let Some(dir) = unambiguous_dir {
-                //     self.tree.contents = load_tree(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                //     self.tree.draw(self.term)?;
-                // } else if tokens.len() > 2 {
-                //     print_error(self.term, "'enter' command must be followed by a directory");
-                // } else if let Some(dir_name) = tokens.get(1) {
+        if let Some(command) = &self.command_buf {
+            //command.0(self, command.1, command.2);
+        } else {
+            match tokens[0] {
+                "enter" => {
+                    if tokens.len() == 2 {
+                        self.enter(Dir::Text(tokens[1]), "")?;
+                    } else {
+                        print_error(self.term, "Usage: enter <directory>")?;
+                    }
+                },
+                "open" => {
+                    if tokens.len() == 2 {
+                        self.open(Dir::Text(tokens[1]), "");
+                    } else {
+                        print_error(self.term, "Usage: open <directory>");
+                    }
+                },
+                "close" => {
                     
-                //     let possible_dirs = to_directory(self.root, dir_name);
-                //     if possible_dirs.len() > 1 {
-                //         self.ambiguous_dirs = possible_dirs;
-                //         self.command_buf = (true, "enter");
-                //     } else {
-                //         self.tree.contents = load_tree(possible_dirs[0], &vec![], &self.hidden_dirs, &mut 0, self.root);
-                //         self.tree.draw(self.term)?;
-                //     }
-                // }
-            },
-            "open" => {
-                if let Some(dir) = get_dir("open", tokens.get(1)) {
-                    if let Some(index) = self.hidden_dirs.iter().position(|e| e == dir) {
-                        self.hidden_dirs.remove(index);
-                        self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                        self.tree.draw(self.term)?;
-                    }
-                }
-            },
-            "close" => {
-                if let Some(dir) = get_dir("close", tokens.get(1)) {
-                    self.hidden_dirs.push(dir);
-                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                    self.tree.draw(self.term)?;
-                }
-            },
-            "move" => { // file   dir
-                if let Some(file_name) = tokens.get(1) {
-                    if let Some(file) = self.curr_dir.files.iter().find(|e| e.name.to_str().unwrap() == *file_name) {
-                        
-                    }
-                }
-                if tokens.len() > 2 {
-                    //print_error("'enter' command must be followed by a directory");
-                }
-            },
-            "rename" => {
-                if let Some(file_name) = tokens.get(1) {
-                    if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
-                        if let Some(new_name) = tokens.get(2) {
-                            fs::rename(file_name, new_name)?;
-                        }
-                    }
-                }
-            },
-            "copy" => {
-                if let Some(file_name) = tokens.get(1) {
-                    if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
-                        if let Some(new_name) = tokens.get(2) {
-                            fs::copy(file_name, new_name)?;
-                        } else {
-                            for i in 1.. {
-                                let copy_name = PathBuf::from(format!("{}_{}", file_name, i));
-                                if copy_name.exists() {
-                                    fs::copy(file_name, copy_name)?;
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "new" => {
-                match tokens.get(1) {
-                    Some(which) if *which == "file" || *which == "directory" => {
-                        if let Some(name) = tokens.get(2) {
-                            let name = Path::new(name);
-                            if name.exists() {
-                                if *which == "file" {
-                                    File::create(name)?;
-                                    // TODO place in correct directory and make sure it gets created
+                },
+                "move" => { // file DIR
+                    
+                },
+                "rename" => { // DIR name
+                    
+                },
+                "copy" => {   // file DIR
+                    
+                },
+                "new" => {
+                    match tokens.get(1) {
+                        Some(which) if *which == "file" || *which == "directory" => {
+                            if let Some(name) = tokens.get(2) {
+                                let name = Path::new(name);
+                                if name.exists() {
+                                    if *which == "file" {
+                                        File::create(name)?;
+                                        // TODO place in correct directory and make sure it gets created
+                                    } else {
+                                        fs::create_dir(name)?;
+                                        self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                                        self.tree.draw(self.term)?;
+                                    }
+                                    self.dir_contents.contents = load_contents(self.curr_dir);
+                                    self.dir_contents.draw(self.term)?;
                                 } else {
-                                    fs::create_dir(name)?;
-                                    self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                                    self.tree.draw(self.term)?;
+                                    print_error(self.term, "File or directory with this name already exists")?;
                                 }
-                                self.dir_contents.contents = load_contents(self.curr_dir);
-                                self.dir_contents.draw(self.term)?;
-                            } else {
-                                print_error(self.term, "File or directory with this name already exists")?;
                             }
+                            print_error(self.term, "Expected name of new file or directory")?;
+                        },
+                        _ => {
+                            print_error(self.term, "Expected 'file' or 'directory' after 'new'")?;
                         }
-                        print_error(self.term, "Expected name of new file or directory")?;
-                    },
-                    _ => {
-                        print_error(self.term, "Expected 'file' or 'directory' after 'new'")?;
                     }
-                }
-            },
-            _ => {},
+                },
+                _ => {},
+            }
         }
 
         self.term.move_cursor_to(3, self.term.size().0 as usize - 1)?;
         Ok(())
     }
 
-    fn open(&self, args: &[Vec<&str>]) {
-        
+    fn get_dir(&mut self, func: Ff<'a, 'b>, unambiguous_dir: Dir<'a, 'b>, other_arg: &str) -> Option<&'a Directory> {
+        match unambiguous_dir {
+            Dir::Disambiguated(dir) => Some(dir),
+            Dir::Text(dir_name) => {
+                let possible_dirs = to_directory(self.root, dir_name);
+                if possible_dirs.len() > 1 {
+                    self.ambiguous_dirs = possible_dirs;
+                    self.command_buf = Some((func, other_arg.to_string()));
+                    None
+                } else {
+                    if let Some(d) = possible_dirs.get(0) {
+                        Some(*d)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn enter(&mut self, dir: Dir<'a, 'b>, other_arg: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::enter, dir, other_arg) {
+            self.tree.contents = load_tree(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+            self.tree.draw(self.term)?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::close, dir, other_arg) {
+            self.hidden_dirs.push(dir);
+            self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+            self.tree.draw(self.term)?;
+        }
+        Ok(())
+    }
+
+    fn open(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::open, dir, other_arg) {
+            if let Some(index) = self.hidden_dirs.iter().position(|&e| e == dir) {
+                self.hidden_dirs.remove(index);
+                self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                self.tree.draw(self.term)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn mov(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+        // if let Some(file_name) = tokens.get(1) {
+        //     if let Some(file) = self.curr_dir.files.iter().find(|e| e.name.to_str().unwrap() == *file_name) {
+                
+        //     }
+        // }
+        // if tokens.len() > 2 {
+        //     //print_error("'enter' command must be followed by a directory");
+        // }
+
+        Ok(())
+    }
+
+    fn rename(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+        // if let Some(file_name) = tokens.get(1) {
+        //     if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
+        //         if let Some(new_name) = tokens.get(2) {
+        //             fs::rename(file_name, new_name)?;
+        //         }
+        //     }
+        // }
+
+        Ok(())
+    }
+
+    fn copy(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+        // if let Some(file_name) = tokens.get(1) {
+        //     if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
+        //         if let Some(new_name) = tokens.get(2) {
+        //             fs::copy(file_name, new_name)?;
+        //         } else {
+        //             for i in 1.. {
+        //                 let copy_name = PathBuf::from(format!("{}_{}", file_name, i));
+        //                 if copy_name.exists() {
+        //                     fs::copy(file_name, copy_name)?;
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+
+        Ok(())
     }
 
     fn highlight_if_multiple(&self, dirs: &Vec<&'a Directory>) -> io::Result<()> {
@@ -713,45 +747,50 @@ fn main() -> io::Result<()> {
                     command.push(c);
                     term.write_str(&c.to_string())?;
                 } else {
-                    let curr_area = match curr_area_tag {
-                        CurrentArea::Tree => &mut manager.tree,
-                        CurrentArea::Contents => &mut manager.dir_contents,
-                        _ => &mut manager.tree,
-                    };
+                    // let curr_area = match curr_area_tag {
+                    //     CurrentArea::Tree => &mut manager.tree,
+                    //     CurrentArea::Contents => &mut manager.dir_contents,
+                    //     _ => &mut manager.tree,
+                    // };
 
-                    match c {
-                        'w' | 'W' => if curr_area.curr_pos.y != 0 {
-                            curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
-                            curr_area.draw(&term)?;
-                        },
-                        'a' | 'A' => if curr_area.curr_pos.x != 0 {
-                            curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
-                            curr_area.draw(&term)?;
-                        },
-                        's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
-                            curr_area.curr_pos.y += min(
-                                curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
-                                5);
-                            curr_area.draw(&term)?;
-                        },
-                        'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
-                            curr_area.curr_pos.x += min(
-                                curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
-                                5);
-                            curr_area.draw(&term)?;
-                        },
-                        _ => {},
-                    }
+                    // match c {
+                    //     'w' | 'W' => if curr_area.curr_pos.y != 0 {
+                    //         curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
+                    //         curr_area.draw(&term)?;
+                    //     },
+                    //     'a' | 'A' => if curr_area.curr_pos.x != 0 {
+                    //         curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
+                    //         curr_area.draw(&term)?;
+                    //     },
+                    //     's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
+                    //         curr_area.curr_pos.y += min(
+                    //             curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
+                    //             5);
+                    //         curr_area.draw(&term)?;
+                    //     },
+                    //     'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
+                    //         curr_area.curr_pos.x += min(
+                    //             curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
+                    //             5);
+                    //         curr_area.draw(&term)?;
+                    //     },
+                    //     _ => {},
+                    // }
                 }
             },
             Enter => {
-                if command == "q" {
-                    break;
-                }
-                manager.process_command(&command)?;
-                let chars = command.chars().count();
-                term.move_cursor_right(chars)?;
-                term.clear_chars(command.chars().count())?;
+                
+                
+                    if command == "q" {
+                        break;
+                    }
+
+                    
+                    {let clone = command.clone(); manager.process_command(&clone);}
+                    let chars = command.chars().count();
+                    term.move_cursor_right(chars)?;
+                    term.clear_chars(command.chars().count())?;
+                
                 command.clear();
             }
             Backspace => {
