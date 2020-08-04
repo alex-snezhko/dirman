@@ -1,11 +1,11 @@
 use std::env;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, Metadata};
 use std::os::windows::prelude::*;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Sub};
-use std::cmp::{PartialEq, max};
+use std::cmp::{PartialEq, max, min};
 use console::{Term, Style};
 use chrono::{DateTime, Utc, Datelike, Timelike};
 use colorful::Color;
@@ -48,22 +48,45 @@ impl Sub for Vector2 {
     }
 }
 
-struct FileInfo {
+struct File {
     name: OsString,
     meta: Metadata,
+    full_path: PathBuf,
 }
 
 struct Directory {
     name: OsString,
     meta: Metadata,
     full_path: PathBuf,
-    files: Vec<FileInfo>,
+    files: Vec<File>,
     directories: Vec<Directory>,
+}
+
+impl File {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            name: OsString::from(path.file_name().unwrap()),
+            meta: path.metadata().unwrap(),
+            full_path: path,
+        }
+    }
+}
+
+impl Directory {
+    fn new(path: PathBuf, files: Vec<File>, directories: Vec<Directory>) -> Self {
+        Self {
+            name: OsString::from(path.file_name().unwrap()),
+            meta: path.metadata().unwrap(),
+            full_path: path,
+            files,
+            directories,
+        }
+    }
 }
 
 impl PartialEq for Directory {
     fn eq(&self, other: &Self) -> bool {
-        self as *const Directory == other as *const Directory
+        self as *const Self == other as *const Self
     }
 }
 
@@ -218,19 +241,19 @@ struct StateManager<'a> {
     curr_dir: &'a Directory,
     hidden_dirs: Vec<&'a Directory>,
     ambiguous_dirs: Vec<&'a Directory>,
-    command_buf: Option<(CommandProcedure<'a>, /*Dir<'a, 'b>, &'b str*/String)>,
+    command_buf: Option<(CommandProcedure<'a>, String)>,
     tree: ScrollableArea,
     dir_contents: ScrollableArea,
 }
 
 enum DirQuery<'a> {
-    Disambiguated(&'a Directory),
+    Disambiguated(&'a mut Directory),
     Text(String),
 }
 
 impl<'a> StateManager<'a> {
 
-    fn process_command(&mut self, command: String) -> io::Result<()> {
+    fn process_command(&mut self, command: &str) -> io::Result<()> {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         if tokens.len() == 0 {
             return Ok(());
@@ -248,8 +271,9 @@ impl<'a> StateManager<'a> {
 
                         let command = self.command_buf.as_ref().unwrap();
                         let unambiguous_dir = self.ambiguous_dirs[num];
-
                         let command_string = command.1.clone();
+                        
+                        self.ambiguous_dirs.clear();
                         command.0(self, DirQuery::Disambiguated(unambiguous_dir), &command_string)?;
                         self.command_buf = None;
                         return Ok(());
@@ -290,8 +314,7 @@ impl<'a> StateManager<'a> {
 
             "move" => {
                 if tokens.len() == 3 {
-                    let file_path = Path::new(tokens[1]);
-                    if file_path.exists() {
+                    if self.curr_dir.files.iter().any(|e| e.name == tokens[1]) {
                         self.move_to_dir(DirQuery::Text(tokens[2].to_string()), tokens[1])?;
                     } else {
                         print_error(self.term, "File attempted to be moved does not exist")?;
@@ -303,9 +326,7 @@ impl<'a> StateManager<'a> {
 
             "copy" => {
                 if tokens.len() == 3 {
-                    let mut file_path = self.curr_dir.full_path.clone();
-                    file_path.push(tokens[1]);
-                    if file_path.exists() {
+                    if self.curr_dir.files.iter().any(|e| e.name == tokens[1]) {
                         self.copy_to_dir(DirQuery::Text(tokens[2].to_string()), tokens[1])?;
                     } else {
                         print_error(self.term, "File attempted to be copied does not exist")?;
@@ -317,16 +338,13 @@ impl<'a> StateManager<'a> {
 
             "rename" => {
                 if tokens.len() == 3 {
-                    let old = Path::new(tokens[1]);
-                    if old.exists() {
-                        if old.is_file() {
-                            //if let Some(file) = self.curr_dir.files.iter().find(|e| e.name == *file_name) 
-                            fs::rename(old, tokens[2])?;
-                        } else if old.is_dir() {
-                            self.rename_dir(DirQuery::Text(tokens[1].to_string()), tokens[2])?;
-                        }
+                    if let Some(old_file) = self.curr_dir.files.iter().find(|e| e.name == tokens[1]) {
+                        // TODO if let Some(file) = self.curr_dir.files.iter().find(|e| e.name == *file_name)
+                        let mut new_path = self.curr_dir.full_path.clone();
+                        new_path.push(tokens[2]);
+                        fs::rename(&old_file.full_path, new_path)?;
                     } else {
-                        print_error(self.term, "File/directory attempted to be renamed does not exist")?;
+                        self.rename_dir(DirQuery::Text(tokens[1].to_string()), tokens[2])?;
                     }
                 } else {
                     print_error(self.term, "Usage: rename <file|directory> <new_name>")?;
@@ -337,20 +355,17 @@ impl<'a> StateManager<'a> {
                 if tokens.len() == 3 {
                     let which = tokens[1];
                     if which == "file" || which == "directory" {
-                        let name = Path::new(tokens[2]);
-                        if !name.exists() {
+                        let mut new_path = self.curr_dir.full_path.clone();
+                        new_path.push(tokens[2]);
+                        if !new_path.exists() {
                             if which == "file" {
-                                let mut new_file_path = self.curr_dir.full_path.clone();
-                                new_file_path.push(name);
-                                File::create(new_file_path)?;
+                                fs::File::create(new_path)?;
                                 // TODO place in correct directory and make sure it gets created
                             } else {
-                                fs::create_dir(name)?;
-                                self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                                self.tree.draw(self.term)?;
+                                fs::create_dir(new_path)?;
+                                self.refresh_area(true, false)?;
                             }
-                            self.dir_contents.contents = load_dir_contents(self.curr_dir);
-                            self.dir_contents.draw(self.term)?;
+                            self.refresh_area(false, true)?;
                         } else {
                             print_error(self.term, "File or directory with this name already exists")?;
                         }
@@ -366,15 +381,27 @@ impl<'a> StateManager<'a> {
 
             _ => {},
         }
-
         
+        Ok(())
+    }
+
+    fn refresh_area(&mut self, tree: bool, contents: bool) -> io::Result<()> {
+        if tree {
+            self.tree.contents = load_tree_contents(self.curr_dir, &self.ambiguous_dirs, &self.hidden_dirs, &mut 0, self.root);
+            self.tree.draw(self.term)?;
+        }
+        if contents {
+            self.dir_contents.contents = load_dir_contents(self.curr_dir);
+            self.dir_contents.draw(self.term)?;
+        }
+
         Ok(())
     }
 
     // helper function for *_dir methods below; checks dir parameter and returns a concrete
     // Directory if there is no ambiguity or None if there is
     fn get_dir(&mut self, func: CommandProcedure<'a>, dir_query: DirQuery<'a>, other_arg: &str)
-        -> io::Result<Option<&'a Directory>>
+        -> io::Result<Option<&'a mut Directory>>
     {
         match dir_query {
             DirQuery::Disambiguated(dir) => Ok(Some(dir)),
@@ -383,14 +410,14 @@ impl<'a> StateManager<'a> {
                 if possible_dirs.len() > 1 {
                     print_error(self.term, "Ambiguous directory; input number corresponding to intended choice")?;
                     self.ambiguous_dirs = possible_dirs;
-                    self.tree.contents = load_tree_contents(self.curr_dir, &self.ambiguous_dirs, &self.hidden_dirs, &mut 0, self.root);
-                    self.tree.draw(self.term)?;
+                    self.refresh_area(true, false)?;
                     self.command_buf = Some((func, other_arg.to_string()));
                     Ok(None)
                 } else {
                     if let Some(d) = possible_dirs.get(0) {
                         Ok(Some(*d))
                     } else {
+                        print_error(self.term, "Specified directory does not exist")?;
                         Ok(None)
                     }
                 }
@@ -400,8 +427,8 @@ impl<'a> StateManager<'a> {
 
     fn enter_dir(&mut self, dir: DirQuery<'a>, other_arg: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::enter_dir, dir, other_arg)? {
-            self.tree.contents = load_tree_contents(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-            self.tree.draw(self.term)?;
+            self.curr_dir = dir;
+            self.refresh_area(true, true)?;
         }
         Ok(())
     }
@@ -409,8 +436,9 @@ impl<'a> StateManager<'a> {
     fn close_dir(&mut self, dir: DirQuery<'a>, other_arg: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::close_dir, dir, other_arg)? {
             self.hidden_dirs.push(dir);
-            self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-            self.tree.draw(self.term)?;
+            self.refresh_area(true, true)?;
+            // TODO if in directory that was closed move current directory to closed directory;
+            // prevent ability to enter closed directory
         }
         Ok(())
     }
@@ -419,8 +447,7 @@ impl<'a> StateManager<'a> {
         if let Some(dir) = self.get_dir(Self::open_dir, dir, other_arg)? {
             if let Some(index) = self.hidden_dirs.iter().position(|&e| e == dir) {
                 self.hidden_dirs.remove(index);
-                self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                self.tree.draw(self.term)?;
+                self.refresh_area(true, false)?;
             }
         }
         Ok(())
@@ -428,7 +455,25 @@ impl<'a> StateManager<'a> {
 
     fn move_to_dir(&mut self, dir: DirQuery<'a>, file_name: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::move_to_dir, dir, file_name)? {
-            fs::rename(&dir.full_path, file_name)?;
+            let mut file_path = self.curr_dir.full_path.clone();
+            file_path.push(file_name);
+            let mut new_path = dir.full_path.clone();
+            new_path.push(file_name);
+            fs::rename(file_path, &new_path)?;
+
+            dir.files.push(File::new(new_path));
+        }
+
+        Ok(())
+    }
+
+    fn copy_to_dir(&mut self, dir: DirQuery<'a>, file_name: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::move_to_dir, dir, file_name)? {
+            let mut file_path = self.curr_dir.full_path.clone();
+            file_path.push(file_name);
+            let mut new_path = dir.full_path.clone();
+            new_path.push(file_name);
+            fs::copy(file_path, new_path)?;
         }
 
         Ok(())
@@ -441,26 +486,6 @@ impl<'a> StateManager<'a> {
 
         Ok(())
     }
-
-    fn copy_to_dir(&mut self, dir: DirQuery<'a>, file_name: &str) -> io::Result<()> {
-        // if let Some(file_name) = tokens.get(1) {
-        //     if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
-        //         if let Some(new_name) = tokens.get(2) {
-        //             fs::copy(file_name, new_name)?;
-        //         } else {
-        //             for i in 1.. {
-        //                 let copy_name = PathBuf::from(format!("{}_{}", file_name, i));
-        //                 if copy_name.exists() {
-        //                     fs::copy(file_name, copy_name)?;
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-
-        Ok(())
-    }
-
 }
 
 fn print_error(term: &Term, message: &str) -> io::Result<()> {
@@ -486,10 +511,10 @@ fn to_directory<'a>(root: &'a Directory, path: &str) -> Vec<&'a Directory> {
 }
 
 fn to_directory_helper<'a>(path: &str, curr_dir: &'a Directory, possible: &mut Vec<&'a Directory>) {
+    if curr_dir.name == path {
+        possible.push(curr_dir);
+    }
     for dir in &curr_dir.directories {
-        if dir.name == path {
-            possible.push(dir);
-        }
         to_directory_helper(path, dir, possible);
     }
 }
@@ -611,9 +636,9 @@ fn load_tree_contents(
 
 fn load_dir_contents(curr_dir: &Directory) -> Vec<Vec<ColoredString>> {
     let mut contents = vec![];
-
     contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
     contents.push(vec![ColoredString::normal("-------------           ----  ----".to_string())]);
+
     if curr_dir.directories.len() != 0 {
         contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
 
@@ -665,10 +690,12 @@ fn file_size_to_str(size: u64) -> String {
 
 fn main() -> io::Result<()> {
     // parse command line arguments and extract directory
-    let path = PathBuf::from(env::args().nth(0).expect("Usage: dirman <directory>"));
+    // let path = PathBuf::from(env::args().nth(1).expect("Usage: dirman <directory>"));
+    let path = env::current_dir()?;
     if !path.is_dir() {
         panic!("Input directory does not exist");
     }
+    
 
     // construct directory tree
     let root = load_dir(path)?;
@@ -772,35 +799,35 @@ fn main() -> io::Result<()> {
                     command.push(c);
                     term.write_str(&c.to_string())?;
                 } else {
-                    // let curr_area = match curr_area_tag {
-                    //     CurrentArea::Tree => &mut manager.tree,
-                    //     CurrentArea::Contents => &mut manager.dir_contents,
-                    //     _ => &mut manager.tree,
-                    // };
+                    let curr_area = match curr_area_tag {
+                        CurrentArea::Tree => &mut manager.tree,
+                        CurrentArea::Contents => &mut manager.dir_contents,
+                        _ => &mut manager.tree,
+                    };
 
-                    // match c {
-                    //     'w' | 'W' => if curr_area.curr_pos.y != 0 {
-                    //         curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
-                    //         curr_area.draw(&term)?;
-                    //     },
-                    //     'a' | 'A' => if curr_area.curr_pos.x != 0 {
-                    //         curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
-                    //         curr_area.draw(&term)?;
-                    //     },
-                    //     's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
-                    //         curr_area.curr_pos.y += min(
-                    //             curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
-                    //             5);
-                    //         curr_area.draw(&term)?;
-                    //     },
-                    //     'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
-                    //         curr_area.curr_pos.x += min(
-                    //             curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
-                    //             5);
-                    //         curr_area.draw(&term)?;
-                    //     },
-                    //     _ => {},
-                    // }
+                    match c {
+                        'w' | 'W' => if curr_area.curr_pos.y != 0 {
+                            curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
+                            curr_area.draw(&term)?;
+                        },
+                        'a' | 'A' => if curr_area.curr_pos.x != 0 {
+                            curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
+                            curr_area.draw(&term)?;
+                        },
+                        's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
+                            curr_area.curr_pos.y += min(
+                                curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
+                                5);
+                            curr_area.draw(&term)?;
+                        },
+                        'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
+                            curr_area.curr_pos.x += min(
+                                curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
+                                5);
+                            curr_area.draw(&term)?;
+                        },
+                        _ => {},
+                    }
                 }
             },
             Enter => {
@@ -811,7 +838,7 @@ fn main() -> io::Result<()> {
                     }
 
                     
-                    manager.process_command(command.clone())?;
+                    manager.process_command(&command)?;
                     manager.term.move_cursor_to(3, manager.term.size().0 as usize - 1)?;
                     let chars = command.chars().count();
                     term.move_cursor_right(chars)?;
@@ -832,25 +859,19 @@ fn main() -> io::Result<()> {
 }
 
 fn load_dir(dir_path: PathBuf) -> io::Result<Directory> {
+    let mut files: Vec<File> = vec![];
     let mut directories: Vec<Directory> = vec![];
-    let mut files: Vec<FileInfo> = vec![];
 
     for entry in fs::read_dir(&dir_path)? {
         let entry = entry?;
+        let entry_path = entry.path();
         
         if entry.file_type()?.is_dir() {
-            directories.push(load_dir(entry.path())?);
+            directories.push(load_dir(entry_path)?);
         } else {
-            files.push(FileInfo { name: entry.file_name(), meta: entry.metadata()? });
+            files.push(File::new(entry.path()));
         }
     }
 
-
-    Ok(Directory {
-        name: OsString::from(dir_path.file_name().unwrap()),
-        meta: dir_path.metadata()?,
-        full_path: dir_path,
-        directories,
-        files
-    })
+    Ok(Directory::new(dir_path, files, directories))
 }
