@@ -5,12 +5,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Sub};
-use std::cmp::{PartialEq, max, min};
+use std::cmp::{PartialEq, max};
 use console::{Term, Style};
 use chrono::{DateTime, Utc, Datelike, Timelike};
 use colorful::Color;
 use colorful::Colorful;
-use colorful::RGB;
 
 #[derive(Debug, Clone, Copy)]
 struct Vector2 {
@@ -57,6 +56,7 @@ struct FileInfo {
 struct Directory {
     name: OsString,
     meta: Metadata,
+    full_path: PathBuf,
     files: Vec<FileInfo>,
     directories: Vec<Directory>,
 }
@@ -210,27 +210,27 @@ impl ScrollableArea {
 #[derive(Clone, Copy, PartialEq)]
 enum CurrentArea { Command, Tree, Contents }
 
-type Ff<'a, 'b> = fn(&mut StateManager<'a, 'b>, Dir<'a, 'b>, &'b str) -> io::Result<()>;
+type CommandProcedure<'a> = fn(&mut StateManager<'a>, DirQuery<'a>, &str) -> io::Result<()>;
 
-struct StateManager<'a, 'b> {
+struct StateManager<'a> {
     term: &'a Term,
     root: &'a Directory,
     curr_dir: &'a Directory,
     hidden_dirs: Vec<&'a Directory>,
     ambiguous_dirs: Vec<&'a Directory>,
-    command_buf: Option<(Ff<'a, 'b>, /*Dir<'a, 'b>, &'b str*/String)>,
+    command_buf: Option<(CommandProcedure<'a>, /*Dir<'a, 'b>, &'b str*/String)>,
     tree: ScrollableArea,
     dir_contents: ScrollableArea,
 }
 
-enum Dir<'a, 'b> {
+enum DirQuery<'a> {
     Disambiguated(&'a Directory),
-    Text(&'b str),
+    Text(String),
 }
 
-impl<'a, 'b> StateManager<'a, 'b> {
+impl<'a> StateManager<'a> {
 
-    fn process_command(&mut self, command: &str) -> io::Result<()> {
+    fn process_command(&mut self, command: String) -> io::Result<()> {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         if tokens.len() == 0 {
             return Ok(());
@@ -240,162 +240,209 @@ impl<'a, 'b> StateManager<'a, 'b> {
         if self.command_buf.is_some() {
             // expect a single number
             if tokens.len() == 1 {
-                if let Ok(num) = tokens[1].parse::<usize>() {
-                    if let Some(unambiguous_dir) = self.ambiguous_dirs.get(num) {
-                        if let Some(command) = &self.command_buf {
-                            //command.0(self, Dir::Disambiguated(*unambiguous_dir), &command.1);
-                        }
+                if let Ok(num) = tokens[0].parse::<usize>() {
+                    if self.ambiguous_dirs.get(num).is_some() && self.command_buf.is_some() {
+                        self.term.move_cursor_to(0, 0)?;
+                        self.term.clear_line()?;
+                        self.term.write_str("DirMan")?;
+
+                        let command = self.command_buf.as_ref().unwrap();
+                        let unambiguous_dir = self.ambiguous_dirs[num];
+
+                        let command_string = command.1.clone();
+                        command.0(self, DirQuery::Disambiguated(unambiguous_dir), &command_string)?;
                         self.command_buf = None;
+                        return Ok(());
                     }
                 } else if tokens[1] == "cancel" {
                     self.ambiguous_dirs.clear();
                 }
-                
             } else {
-                print_error(self.term, "Input a single number for disambiguation or 'cancel' to cancel command")?;
+                print_error(self.term, "Input a number for disambiguation or 'cancel' to cancel command")?;
                 return Ok(());
             }
         }
 
-        if let Some(command) = &self.command_buf {
-            //command.0(self, command.1, command.2);
-        } else {
-            match tokens[0] {
-                "enter" => {
-                    if tokens.len() == 2 {
-                        self.enter(Dir::Text(tokens[1]), "")?;
+        match tokens[0] {
+            "enter" => {
+                if tokens.len() == 2 {
+                    self.enter_dir(DirQuery::Text(tokens[1].to_string()), "")?;
+                } else {
+                    print_error(self.term, "Usage: enter <directory>")?;
+                }
+            },
+
+            "open" => {
+                if tokens.len() == 2 {
+                    self.open_dir(DirQuery::Text(tokens[1].to_string()), "")?;
+                } else {
+                    print_error(self.term, "Usage: open <directory>")?;
+                }
+            },
+
+            "close" => {
+                if tokens.len() == 2 {
+                    self.close_dir(DirQuery::Text(tokens[1].to_string()), "")?;
+                } else {
+                    print_error(self.term, "Usage: close <directory>")?;
+                }
+            },
+
+            "move" => {
+                if tokens.len() == 3 {
+                    let file_path = Path::new(tokens[1]);
+                    if file_path.exists() {
+                        self.move_to_dir(DirQuery::Text(tokens[2].to_string()), tokens[1])?;
                     } else {
-                        print_error(self.term, "Usage: enter <directory>")?;
+                        print_error(self.term, "File attempted to be moved does not exist")?;
                     }
-                },
-                "open" => {
-                    if tokens.len() == 2 {
-                        self.open(Dir::Text(tokens[1]), "");
+                } else {
+                    print_error(self.term, "Usage: move <file> <directory>")?;
+                }
+            },
+
+            "copy" => {
+                if tokens.len() == 3 {
+                    let mut file_path = self.curr_dir.full_path.clone();
+                    file_path.push(tokens[1]);
+                    if file_path.exists() {
+                        self.copy_to_dir(DirQuery::Text(tokens[2].to_string()), tokens[1])?;
                     } else {
-                        print_error(self.term, "Usage: open <directory>");
+                        print_error(self.term, "File attempted to be copied does not exist")?;
                     }
-                },
-                "close" => {
-                    
-                },
-                "move" => { // file DIR
-                    
-                },
-                "rename" => { // DIR name
-                    
-                },
-                "copy" => {   // file DIR
-                    
-                },
-                "new" => {
-                    match tokens.get(1) {
-                        Some(which) if *which == "file" || *which == "directory" => {
-                            if let Some(name) = tokens.get(2) {
-                                let name = Path::new(name);
-                                if name.exists() {
-                                    if *which == "file" {
-                                        File::create(name)?;
-                                        // TODO place in correct directory and make sure it gets created
-                                    } else {
-                                        fs::create_dir(name)?;
-                                        self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
-                                        self.tree.draw(self.term)?;
-                                    }
-                                    self.dir_contents.contents = load_contents(self.curr_dir);
-                                    self.dir_contents.draw(self.term)?;
-                                } else {
-                                    print_error(self.term, "File or directory with this name already exists")?;
-                                }
+                } else {
+                    print_error(self.term, "Usage: copy <file> <directory>")?;
+                }
+            },
+
+            "rename" => {
+                if tokens.len() == 3 {
+                    let old = Path::new(tokens[1]);
+                    if old.exists() {
+                        if old.is_file() {
+                            //if let Some(file) = self.curr_dir.files.iter().find(|e| e.name == *file_name) 
+                            fs::rename(old, tokens[2])?;
+                        } else if old.is_dir() {
+                            self.rename_dir(DirQuery::Text(tokens[1].to_string()), tokens[2])?;
+                        }
+                    } else {
+                        print_error(self.term, "File/directory attempted to be renamed does not exist")?;
+                    }
+                } else {
+                    print_error(self.term, "Usage: rename <file|directory> <new_name>")?;
+                }
+            },
+
+            "new" => {
+                if tokens.len() == 3 {
+                    let which = tokens[1];
+                    if which == "file" || which == "directory" {
+                        let name = Path::new(tokens[2]);
+                        if !name.exists() {
+                            if which == "file" {
+                                let mut new_file_path = self.curr_dir.full_path.clone();
+                                new_file_path.push(name);
+                                File::create(new_file_path)?;
+                                // TODO place in correct directory and make sure it gets created
+                            } else {
+                                fs::create_dir(name)?;
+                                self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                                self.tree.draw(self.term)?;
                             }
-                            print_error(self.term, "Expected name of new file or directory")?;
-                        },
-                        _ => {
-                            print_error(self.term, "Expected 'file' or 'directory' after 'new'")?;
+                            self.dir_contents.contents = load_dir_contents(self.curr_dir);
+                            self.dir_contents.draw(self.term)?;
+                        } else {
+                            print_error(self.term, "File or directory with this name already exists")?;
                         }
                     }
-                },
-                _ => {},
+                } else {
+                    print_error(self.term, "Usage: new [file|directory] <name>")?;
+                }
+            },
+
+            "remove" => {
+
             }
+
+            _ => {},
         }
 
-        self.term.move_cursor_to(3, self.term.size().0 as usize - 1)?;
+        
         Ok(())
     }
 
-    fn get_dir(&mut self, func: Ff<'a, 'b>, unambiguous_dir: Dir<'a, 'b>, other_arg: &str) -> Option<&'a Directory> {
-        match unambiguous_dir {
-            Dir::Disambiguated(dir) => Some(dir),
-            Dir::Text(dir_name) => {
-                let possible_dirs = to_directory(self.root, dir_name);
+    // helper function for *_dir methods below; checks dir parameter and returns a concrete
+    // Directory if there is no ambiguity or None if there is
+    fn get_dir(&mut self, func: CommandProcedure<'a>, dir_query: DirQuery<'a>, other_arg: &str)
+        -> io::Result<Option<&'a Directory>>
+    {
+        match dir_query {
+            DirQuery::Disambiguated(dir) => Ok(Some(dir)),
+            DirQuery::Text(dir_name) => {
+                let possible_dirs = to_directory(self.root, &dir_name);
                 if possible_dirs.len() > 1 {
+                    print_error(self.term, "Ambiguous directory; input number corresponding to intended choice")?;
                     self.ambiguous_dirs = possible_dirs;
+                    self.tree.contents = load_tree_contents(self.curr_dir, &self.ambiguous_dirs, &self.hidden_dirs, &mut 0, self.root);
+                    self.tree.draw(self.term)?;
                     self.command_buf = Some((func, other_arg.to_string()));
-                    None
+                    Ok(None)
                 } else {
                     if let Some(d) = possible_dirs.get(0) {
-                        Some(*d)
+                        Ok(Some(*d))
                     } else {
-                        None
+                        Ok(None)
                     }
                 }
             }
         }
     }
 
-    fn enter(&mut self, dir: Dir<'a, 'b>, other_arg: &str) -> io::Result<()> {
-        if let Some(dir) = self.get_dir(Self::enter, dir, other_arg) {
-            self.tree.contents = load_tree(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+    fn enter_dir(&mut self, dir: DirQuery<'a>, other_arg: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::enter_dir, dir, other_arg)? {
+            self.tree.contents = load_tree_contents(dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
             self.tree.draw(self.term)?;
         }
         Ok(())
     }
 
-    fn close(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
-        if let Some(dir) = self.get_dir(Self::close, dir, other_arg) {
+    fn close_dir(&mut self, dir: DirQuery<'a>, other_arg: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::close_dir, dir, other_arg)? {
             self.hidden_dirs.push(dir);
-            self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+            self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
             self.tree.draw(self.term)?;
         }
         Ok(())
     }
 
-    fn open(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
-        if let Some(dir) = self.get_dir(Self::open, dir, other_arg) {
+    fn open_dir(&mut self, dir: DirQuery<'a>, other_arg: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::open_dir, dir, other_arg)? {
             if let Some(index) = self.hidden_dirs.iter().position(|&e| e == dir) {
                 self.hidden_dirs.remove(index);
-                self.tree.contents = load_tree(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
+                self.tree.contents = load_tree_contents(self.curr_dir, &vec![], &self.hidden_dirs, &mut 0, self.root);
                 self.tree.draw(self.term)?;
             }
         }
         Ok(())
     }
 
-    fn mov(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
-        // if let Some(file_name) = tokens.get(1) {
-        //     if let Some(file) = self.curr_dir.files.iter().find(|e| e.name.to_str().unwrap() == *file_name) {
-                
-        //     }
-        // }
-        // if tokens.len() > 2 {
-        //     //print_error("'enter' command must be followed by a directory");
-        // }
+    fn move_to_dir(&mut self, dir: DirQuery<'a>, file_name: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::move_to_dir, dir, file_name)? {
+            fs::rename(&dir.full_path, file_name)?;
+        }
 
         Ok(())
     }
 
-    fn rename(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
-        // if let Some(file_name) = tokens.get(1) {
-        //     if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
-        //         if let Some(new_name) = tokens.get(2) {
-        //             fs::rename(file_name, new_name)?;
-        //         }
-        //     }
-        // }
+    fn rename_dir(&mut self, dir: DirQuery<'a>, new_name: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::rename_dir, dir, new_name)? {
+            fs::rename(&dir.full_path, new_name)?;
+        }
 
         Ok(())
     }
 
-    fn copy(&mut self, dir: Dir<'a, 'b>, other_arg: &'b str) -> io::Result<()> {
+    fn copy_to_dir(&mut self, dir: DirQuery<'a>, file_name: &str) -> io::Result<()> {
         // if let Some(file_name) = tokens.get(1) {
         //     if self.curr_dir.files.iter().any(|e| e.name == *file_name) {
         //         if let Some(new_name) = tokens.get(2) {
@@ -414,21 +461,11 @@ impl<'a, 'b> StateManager<'a, 'b> {
         Ok(())
     }
 
-    fn highlight_if_multiple(&self, dirs: &Vec<&'a Directory>) -> io::Result<()> {
-        if dirs.len() > 1 {
-            load_tree(self.curr_dir, &vec![], dirs, &mut 0, self.root);
-            self.tree.draw(self.term)?;
-        }
-        self.term.move_cursor_to(0, 0)?;
-        //print_error(self.term.write_str("Ambiguous file/directory; input number of intended choice")?;
-
-        Ok(())
-    }
-
 }
 
 fn print_error(term: &Term, message: &str) -> io::Result<()> {
     term.move_cursor_to(0, 0)?;
+    term.clear_line()?;
     term.write_str(&format!("{}", message.color(Color::Red)))?;
     Ok(())
 }
@@ -515,7 +552,7 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     Ok(())
 }
 
-fn load_tree(
+fn load_tree_contents(
     selected_dir: &Directory,
     ambiguous_dirs: &Vec<&Directory>,
     hidden_dirs: &Vec<&Directory>,
@@ -557,7 +594,7 @@ fn load_tree(
             ("├─ ", "│  ")
         };
 
-        let inner_dir_content = load_tree(selected_dir, ambiguous_dirs, hidden_dirs, selected_dir_num, dir);
+        let inner_dir_content = load_tree_contents(selected_dir, ambiguous_dirs, hidden_dirs, selected_dir_num, dir);
 
         let mut first = true;
         for e in inner_dir_content {
@@ -572,7 +609,7 @@ fn load_tree(
     contents
 }
 
-fn load_contents(curr_dir: &Directory) -> Vec<Vec<ColoredString>> {
+fn load_dir_contents(curr_dir: &Directory) -> Vec<Vec<ColoredString>> {
     let mut contents = vec![];
 
     contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
@@ -628,19 +665,9 @@ fn file_size_to_str(size: u64) -> String {
 
 fn main() -> io::Result<()> {
     // parse command line arguments and extract directory
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() != 2 {
-        println!("usage: dirman <root directory>");
-        // TODO exit
-    }
-
-    let dir_str: &String = &args[1];
-    let path: &Path = Path::new(dir_str);
-
+    let path = PathBuf::from(env::args().nth(0).expect("Usage: dirman <directory>"));
     if !path.is_dir() {
-        println!("input directory does not exist");
-        return Ok(());
+        panic!("Input directory does not exist");
     }
 
     // construct directory tree
@@ -651,11 +678,9 @@ fn main() -> io::Result<()> {
     // find dimensions for screen areas
     let size = Vector2 { x: term.size().1 as usize, y: term.size().0 as usize };
 
-    let curr_dir = &root;
-
     let line_x = (size.x as f64 * 0.5) as usize;
 
-    let tree_contents = load_tree(&root, &vec![], &vec![], &mut 0, &root);
+    let tree_contents = load_tree_contents(&root, &vec![], &vec![], &mut 0, &root);
     let tree_area = ScrollableArea {
         screen_offset: Vector2 { x: 0, y: 2 },
         size: Vector2 { x: line_x, y: size.y - 4 },
@@ -666,7 +691,7 @@ fn main() -> io::Result<()> {
         contents: tree_contents,
     };
 
-    let dir_contents = load_contents(&root);
+    let dir_contents = load_dir_contents(&root);
     let contents_area = ScrollableArea {
         screen_offset: Vector2 { x: line_x + 1, y: 2 },
         size: Vector2 { x: (size.x - line_x - 1), y: size.y - 4 },
@@ -677,13 +702,13 @@ fn main() -> io::Result<()> {
         contents: dir_contents,
     };
 
-    let command_area = ScrollableArea {
-        screen_offset: Vector2 { x: 3, y: size.y - 2 },
-        size: Vector2 { x: size.x - 3, y: 1 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-        contents: vec![],
-        longest_line_len: 0,
-    };
+    // let command_area = ScrollableArea {
+    //     screen_offset: Vector2 { x: 3, y: size.y - 2 },
+    //     size: Vector2 { x: size.x - 3, y: 1 },
+    //     curr_pos: Vector2 { x: 0, y: 0 },
+    //     contents: vec![],
+    //     longest_line_len: 0,
+    // };
 
     let mut manager = StateManager {
         term: &term,
@@ -786,7 +811,8 @@ fn main() -> io::Result<()> {
                     }
 
                     
-                    {let clone = command.clone(); manager.process_command(&clone);}
+                    manager.process_command(command.clone())?;
+                    manager.term.move_cursor_to(3, manager.term.size().0 as usize - 1)?;
                     let chars = command.chars().count();
                     term.move_cursor_right(chars)?;
                     term.clear_chars(command.chars().count())?;
@@ -805,23 +831,25 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn load_dir(dir_path: &Path) -> io::Result<Directory> {
+fn load_dir(dir_path: PathBuf) -> io::Result<Directory> {
     let mut directories: Vec<Directory> = vec![];
     let mut files: Vec<FileInfo> = vec![];
 
-    for entry in fs::read_dir(dir_path)? {
+    for entry in fs::read_dir(&dir_path)? {
         let entry = entry?;
         
         if entry.file_type()?.is_dir() {
-            directories.push(load_dir(&entry.path())?);
+            directories.push(load_dir(entry.path())?);
         } else {
             files.push(FileInfo { name: entry.file_name(), meta: entry.metadata()? });
         }
     }
 
+
     Ok(Directory {
-        name: dir_path.file_name().unwrap().to_os_string(),
+        name: OsString::from(dir_path.file_name().unwrap()),
         meta: dir_path.metadata()?,
+        full_path: dir_path,
         directories,
         files
     })
