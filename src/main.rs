@@ -415,8 +415,8 @@ impl<'a> StateManager<'a> {
                         new_path.push(tokens[2]);
                         if !new_path.exists() {
                             if which == "file" {
-                                fs::File::create(new_path)?;
-
+                                fs::File::create(&new_path)?;
+                                Self::add_file(self.curr_dir.clone(), new_path);
                                 // TODO place in correct directory and make sure it gets created
                             } else {
                                 fs::create_dir(new_path)?;
@@ -448,24 +448,45 @@ impl<'a> StateManager<'a> {
         Ok(())
     }
 
-    fn add_file(dir: DirectoryRef, path: PathBuf) {
-        let files = dir.borrow().files;
+    // gets path for new file (copied, moved, etc); will be different from original if a file
+    // with the given path already exists
+    fn get_copy_path(original: PathBuf) -> PathBuf {
+        if original.exists() {
+            for i in 1.. {
+                let mut s = String::new();
+                if let Some(file_stem) = original.file_stem() {
+                    s.push_str(file_stem.to_str().unwrap());
+                }
+                s.push_str(&format!("_{}", i));
+                if let Some(ext) = original.extension() {
+                    s.push_str(&format!(".{}", ext.to_str().unwrap()));
+                }
 
-        let mut index = 0;
+                let mut copy = original.parent().unwrap().to_path_buf();
+                copy.push(s);
+                if !copy.exists() {
+                    return copy;
+                }
+            }
+        }
+        original
+    }
+
+    // adds a file to the in-memory directory tree data structure
+    fn add_file(dir: DirectoryRef, path: PathBuf) {
+        let files = &mut dir.borrow_mut().files;
+
         let mut low = 0;
         let mut high = files.len() - 1;
-        while low < high {
+        while low != high {
             let mid = (high + low) / 2;
             if files[mid].borrow().name > path {
                 high = mid;
-            } else if files[mid].borrow().name < path {
-                low = mid;
             } else {
-                index = mid;
-                break;
+                low = mid;
             }
         }
-        dir.borrow_mut().files.insert(index, Rc::new(RefCell::new(File::new(path))));
+        files.insert(low, Rc::new(RefCell::new(File::new(path))));
     }
 
     // +----------------------------------+
@@ -549,6 +570,7 @@ impl<'a> StateManager<'a> {
             file_path.push(file_name);
             let mut new_path = dir.borrow().full_path.clone();
             new_path.push(file_name);
+            new_path = Self::get_copy_path(new_path);
             fs::rename(file_path, &new_path)?;
 
             // remove this file from the current directory
@@ -559,7 +581,7 @@ impl<'a> StateManager<'a> {
             self.curr_dir.borrow_mut().files.remove(index);
 
             // add this file to its new directory
-            dir.borrow_mut().files.push(Rc::new(RefCell::new(File::new(new_path))));
+            Self::add_file(dir, new_path);
             self.refresh_area(false, true)?;
         }
 
@@ -573,6 +595,7 @@ impl<'a> StateManager<'a> {
             file_path.push(file_name);
             let mut new_path = dir.borrow().full_path.clone();
             new_path.push(file_name);
+            new_path = Self::get_copy_path(new_path);
             fs::copy(file_path, &new_path)?;
 
             // add this file to its new directory
