@@ -246,28 +246,70 @@ enum DirQuery {
 }
 
 // a function that will be used for command buffering if a directory ambiguity is present
-type CommandProcedure<'d> = fn(&mut StateManager<'d>, DirQuery, &str) -> io::Result<()>;
+type CommandProcedure<'a> = fn(&mut StateManager<'a>, DirQuery, &str) -> io::Result<()>;
 
 // object which manages 'global' state of the program
-struct StateManager<'d> {
-    term: &'d Term,
+struct StateManager<'a> {
+    term: &'a Term,
     root: DirectoryRef,
     curr_dir: DirectoryRef,
-    hidden_dirs: Vec<DirectoryRef>,
+    closed_dirs: Vec<DirectoryRef>,
     ambiguous_dirs: Vec<DirectoryRef>,
-    command_buf: Option<(CommandProcedure<'d>, String)>,
+    command_buf: Option<(CommandProcedure<'a>, String)>,
+    error_message_active: bool,
     tree: ScrollableArea,
     dir_contents: ScrollableArea,
 }
 
-impl<'d> StateManager<'d> {
+impl<'a> StateManager<'a> {
+    fn init(term: &'a Term, root: DirectoryRef) -> io::Result<Self> {
+        let term_size = Vector2 { x: term.size().1 as usize, y: term.size().0 as usize };
+        let line_x = (term_size.x as f64 * 0.5) as usize;
+
+        let tree_area = ScrollableArea {
+            screen_offset: Vector2 { x: 0, y: 2 },
+            size: Vector2 { x: line_x, y: term_size.y - 4 },
+            curr_pos: Vector2 { x: 0, y: 0 },
+            longest_line_len: 0,
+            contents: vec![],
+        };
+
+        let contents_area = ScrollableArea {
+            screen_offset: Vector2 { x: line_x + 1, y: 2 },
+            size: Vector2 { x: (term_size.x - line_x - 1), y: term_size.y - 4 },
+            curr_pos: Vector2 { x: 0, y: 0 },
+            longest_line_len: 0,
+            contents: vec![],
+        };
+
+        let mut new = Self {
+            term,
+            root: root.clone(),
+            curr_dir: root.clone(),
+            closed_dirs: vec![],
+            ambiguous_dirs: vec![],
+            command_buf: None,
+            error_message_active: false,
+            tree: tree_area,
+            dir_contents: contents_area,
+        };
+
+        new.refresh_area(true, true)?;
+
+        Ok(new)
+    }
 
     // processes a user command and updates the directory contents if needed
     fn process_command(&mut self, command: &str) -> io::Result<()> {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         if tokens.len() == 0 {
+            self.print_error("Enter a command")?;
             return Ok(());
         }
+
+        // initially assume no error; if no error message is printed from this command then clear
+        // the error message (if there is one)
+        self.error_message_active = false;
 
         // this condition is true if there is disambiguation needed
         if self.command_buf.is_some() {
@@ -275,9 +317,7 @@ impl<'d> StateManager<'d> {
             if tokens.len() == 1 {
                 if let Ok(num) = tokens[0].parse::<usize>() {
                     if self.ambiguous_dirs.get(num).is_some() && self.command_buf.is_some() {
-                        self.term.move_cursor_to(0, 0)?;
-                        self.term.clear_line()?;
-                        self.term.write_str("DirMan")?;
+                        self.clear_error()?;
 
                         let command = self.command_buf.as_ref().unwrap();
                         let unambiguous_dir = self.ambiguous_dirs[num].clone();
@@ -288,16 +328,19 @@ impl<'d> StateManager<'d> {
                         // execute the buffered command with the now disambiguated directory
                         command.0(self, DirQuery::Disambiguated(unambiguous_dir), &command_string)?;
                         self.command_buf = None;
+                        return Ok(());
                     }
-                } else if tokens[1] == "cancel" {
+                } else if tokens[0] == "cancel" {
+                    self.clear_error()?;
                     self.ambiguous_dirs.clear();
                     self.command_buf = None;
+                    self.refresh_area(true, false)?;
+                    return Ok(());
                 }
-                return Ok(());
-            } else {
-                print_error(self.term, "Input a number for disambiguation or 'cancel' to cancel command")?;
-                return Ok(());
             }
+
+            self.print_error("Input a number for disambiguation or 'cancel' to cancel command")?;
+            return Ok(());
         }
 
         match tokens[0] {
@@ -305,7 +348,7 @@ impl<'d> StateManager<'d> {
                 if tokens.len() == 2 {
                     self.enter_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
                 } else {
-                    print_error(self.term, "Usage: enter <directory>")?;
+                    self.print_error("Usage: enter <directory>")?;
                 }
             },
 
@@ -313,7 +356,7 @@ impl<'d> StateManager<'d> {
                 if tokens.len() == 2 {
                     self.open_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
                 } else {
-                    print_error(self.term, "Usage: open <directory>")?;
+                    self.print_error("Usage: open <directory>")?;
                 }
             },
 
@@ -321,7 +364,7 @@ impl<'d> StateManager<'d> {
                 if tokens.len() == 2 {
                     self.close_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
                 } else {
-                    print_error(self.term, "Usage: close <directory>")?;
+                    self.print_error("Usage: close <directory>")?;
                 }
             },
 
@@ -330,10 +373,10 @@ impl<'d> StateManager<'d> {
                     if self.curr_dir.borrow().files.iter().any(|e| e.borrow().name == tokens[1]) {
                         self.move_to_dir(DirQuery::ByName(tokens[2].to_string()), tokens[1])?;
                     } else {
-                        print_error(self.term, "File attempted to be moved does not exist")?;
+                        self.print_error("File attempted to be moved does not exist")?;
                     }
                 } else {
-                    print_error(self.term, "Usage: move <file> <directory>")?;
+                    self.print_error("Usage: move <file> <directory>")?;
                 }
             },
 
@@ -342,17 +385,16 @@ impl<'d> StateManager<'d> {
                     if self.curr_dir.borrow().files.iter().any(|e| e.borrow().name == tokens[1]) {
                         self.copy_to_dir(DirQuery::ByName(tokens[2].to_string()), tokens[1])?;
                     } else {
-                        print_error(self.term, "File attempted to be copied does not exist")?;
+                        self.print_error("File attempted to be copied does not exist")?;
                     }
                 } else {
-                    print_error(self.term, "Usage: copy <file> <directory>")?;
+                    self.print_error("Usage: copy <file> <directory>")?;
                 }
             },
 
             "rename" => {
                 if tokens.len() == 3 {
                     if let Some(old_file) = self.curr_dir.clone().borrow().files.iter().find(|e| e.borrow().name == tokens[1]) {
-                        // TODO if let Some(file) = self.curr_dir.files.iter().find(|e| e.name == *file_name)
                         let mut new_path = self.curr_dir.borrow().full_path.clone();
                         new_path.push(tokens[2]);
                         fs::rename(&old_file.borrow().full_path, new_path)?;
@@ -360,7 +402,7 @@ impl<'d> StateManager<'d> {
                         self.rename_dir(DirQuery::ByName(tokens[1].to_string()), tokens[2])?;
                     }
                 } else {
-                    print_error(self.term, "Usage: rename <file|directory> <new_name>")?;
+                    self.print_error("Usage: rename <file|directory> <new_name>")?;
                 }
             },
 
@@ -374,6 +416,7 @@ impl<'d> StateManager<'d> {
                         if !new_path.exists() {
                             if which == "file" {
                                 fs::File::create(new_path)?;
+
                                 // TODO place in correct directory and make sure it gets created
                             } else {
                                 fs::create_dir(new_path)?;
@@ -381,11 +424,11 @@ impl<'d> StateManager<'d> {
                             }
                             self.refresh_area(false, true)?;
                         } else {
-                            print_error(self.term, "File or directory with this name already exists")?;
+                            self.print_error("File or directory with this name already exists")?;
                         }
                     }
                 } else {
-                    print_error(self.term, "Usage: new [file|directory] <name>")?;
+                    self.print_error("Usage: new [file|directory] <name>")?;
                 }
             },
 
@@ -393,58 +436,45 @@ impl<'d> StateManager<'d> {
 
             }
 
-            _ => {},
+            _ => {
+                self.print_error("Invalid command")?;
+            },
+        }
+
+        if !self.error_message_active {
+            self.clear_error()?;
         }
         
         Ok(())
     }
 
-    // reloads contents of (and redraws) the specified areas
-    fn refresh_area(&mut self, tree: bool, contents: bool) -> io::Result<()> {
-        if tree {
-            self.tree.contents = load_tree_contents(self.curr_dir.clone(), &self.ambiguous_dirs, &self.hidden_dirs, &mut 0, self.root.clone());
-            self.tree.draw(self.term)?;
-        }
-        if contents {
-            self.dir_contents.contents = load_dir_contents(self.curr_dir.clone());
-            self.dir_contents.draw(self.term)?;
-        }
+    fn add_file(dir: DirectoryRef, path: PathBuf) {
+        let files = dir.borrow().files;
 
-        Ok(())
-    }
-
-    // returns a list of possible directories which match the searched name/path
-    fn to_directory(&self, path: &str) -> Vec<DirectoryRef> {
-        let parts: Vec<&str> = path.split("/").collect();
-        
-        // narrows down the possible valid directories part by part of the path specified
-        let mut possible = vec![self.root.clone()];
-        for part in &parts {
-            let mut new: Vec<DirectoryRef> = vec![];
-            for dir in &possible {
-                Self::to_directory_helper(part, dir.clone(), &mut new);
+        let mut index = 0;
+        let mut low = 0;
+        let mut high = files.len() - 1;
+        while low < high {
+            let mid = (high + low) / 2;
+            if files[mid].borrow().name > path {
+                high = mid;
+            } else if files[mid].borrow().name < path {
+                low = mid;
+            } else {
+                index = mid;
+                break;
             }
-            possible = new;
         }
-        
-        possible
+        dir.borrow_mut().files.insert(index, Rc::new(RefCell::new(File::new(path))));
     }
-    
-    // recursively goes through each directory in the tree and returns all matches
-    fn to_directory_helper(path: &str, curr_dir: DirectoryRef, possible: &mut Vec<DirectoryRef>) {
-        if curr_dir.borrow().name == path {
-            possible.push(curr_dir.clone());
-        }
 
-        let clone = curr_dir.clone();
-        for dir in &clone.borrow().directories {
-            Self::to_directory_helper(path, dir.clone(), possible);
-        }
-    }
+    // +----------------------------------+
+    // |   Bufferable command functions   |
+    // +----------------------------------+
 
     // helper function for *_dir methods below; checks dir parameter and returns a concrete
     // Directory if there is no ambiguity or None if there is
-    fn get_dir(&mut self, func: CommandProcedure<'d>, dir_query: DirQuery, other_arg: &str)
+    fn get_dir(&mut self, func: CommandProcedure<'a>, dir_query: DirQuery, other_arg: &str)
         -> io::Result<Option<DirectoryRef>>
     {
         match dir_query {
@@ -455,7 +485,7 @@ impl<'d> StateManager<'d> {
                 // get list of all possible directories that match the query
                 let possible_dirs = self.to_directory(&dir_name);
                 if possible_dirs.len() > 1 {
-                    print_error(self.term, "Ambiguous directory; input number corresponding to intended choice")?;
+                    self.print_error("Ambiguous directory; input number corresponding to intended choice")?;
                     self.ambiguous_dirs = possible_dirs;
                     self.refresh_area(true, false)?;
                     // buffer a command for disambiguation
@@ -466,7 +496,7 @@ impl<'d> StateManager<'d> {
                     if let Some(d) = possible_dirs.get(0) {
                         Ok(Some(d.clone()))
                     } else {
-                        print_error(self.term, "Specified directory does not exist")?;
+                        self.print_error("Specified directory does not exist")?;
                         Ok(None)
                     }
                 }
@@ -486,10 +516,17 @@ impl<'d> StateManager<'d> {
     // hides the inner directories of an opened directory in the directory tree
     fn close_dir(&mut self, dir: DirQuery, other_arg: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::close_dir, dir, other_arg)? {
-            self.hidden_dirs.push(dir);
+            self.closed_dirs.push(dir.clone());
+
+            // if the current directory is a child of the closed directory then move
+            // the current directory up to the closed one
+            if self.curr_dir.borrow().full_path.to_str().unwrap()
+            .contains(dir.borrow().full_path.to_str().unwrap())
+            {
+                self.curr_dir = dir;
+            }
+
             self.refresh_area(true, true)?;
-            // TODO if in directory that was closed move current directory to closed directory;
-            // prevent ability to enter closed directory
         }
         Ok(())
     }
@@ -497,8 +534,8 @@ impl<'d> StateManager<'d> {
     // opens a closed directory in the directory tree
     fn open_dir(&mut self, dir: DirQuery, other_arg: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::open_dir, dir, other_arg)? {
-            if let Some(index) = self.hidden_dirs.iter().position(|e| *e == dir) {
-                self.hidden_dirs.remove(index);
+            if let Some(index) = self.closed_dirs.iter().position(|e| *e == dir) {
+                self.closed_dirs.remove(index);
                 self.refresh_area(true, false)?;
             }
         }
@@ -515,7 +552,10 @@ impl<'d> StateManager<'d> {
             fs::rename(file_path, &new_path)?;
 
             // remove this file from the current directory
-            let index = self.curr_dir.borrow().files.iter().position(|e| e.borrow().name == file_name).unwrap();
+            let index = self.curr_dir.borrow().files
+                .iter()
+                .position(|e| e.borrow().name == file_name)
+                .unwrap();
             self.curr_dir.borrow_mut().files.remove(index);
 
             // add this file to its new directory
@@ -536,7 +576,7 @@ impl<'d> StateManager<'d> {
             fs::copy(file_path, &new_path)?;
 
             // add this file to its new directory
-            dir.borrow_mut().files.push(Rc::new(RefCell::new(File::new(new_path))));
+            Self::add_file(dir, new_path);
             self.refresh_area(false, true)?;
         }
 
@@ -551,13 +591,199 @@ impl<'d> StateManager<'d> {
 
         Ok(())
     }
-}
 
-fn print_error(term: &Term, message: &str) -> io::Result<()> {
-    term.move_cursor_to(0, 0)?;
-    term.clear_line()?;
-    term.write_str(&format!("{}", message.color(Color::Red)))?;
-    Ok(())
+    // +-----------------------------------------+
+    // |   End of bufferable command functions   |
+    // +-----------------------------------------+
+
+    // prints an error message to the top of the terminal window
+    fn print_error(&mut self, message: &str) -> io::Result<()> {
+        self.term.move_cursor_to(0, 0)?;
+        self.term.clear_line()?;
+        self.term.write_str(&format!("{}", message.color(Color::Red)))?;
+        self.error_message_active = true;
+        Ok(())
+    }
+    
+    // clears error message (if there was one) and prints 'DirMan' at top of terminal window
+    fn clear_error(&self) -> io::Result<()> {
+        self.term.move_cursor_to(0, 0)?;
+        self.term.clear_line()?;
+        self.term.write_str("DirMan")?;
+        Ok(())
+    }
+
+    fn load_tree_contents(&self,
+        selected_dir_num: &mut i32, // counter for when multiple directories are selected, to display each with own number
+        curr_dir: DirectoryRef,     // current dir being processed
+    ) -> Vec<Vec<ColoredString>>
+    {
+        let mut contents = vec![];
+    
+        let curr_dir_name: String = curr_dir.borrow().name.clone().into_string().unwrap();
+    
+        // flags for what needs to be printed e.g. '<dir> +' and/or '<dir>: #' for closed/ambiguous
+        let mut closed = false;
+        let mut ambiguous = false;
+
+        // flag for which color to print the directory name in;
+        // precedence of current(blue) > ambiguous(red) > closed(gray) > normal(default color)
+        let mut dir_name_color: Option<Color> = None;
+        
+        if curr_dir == self.curr_dir {
+            dir_name_color = Some(Color::Blue);
+        }
+        if self.ambiguous_dirs.contains(&curr_dir) {
+            ambiguous = true;
+            if let None = dir_name_color {
+                dir_name_color = Some(Color::Red);
+            }
+        }
+        if self.closed_dirs.contains(&curr_dir) {
+            closed = true;
+            if let None = dir_name_color {
+                dir_name_color = Some(Color::DarkGray);
+            }
+        }
+
+        // append all text related to the directory name
+        let mut directory_text = vec![];
+        directory_text.push(
+            if let Some(color) = dir_name_color { ColoredString::colored(curr_dir_name, color) }
+            else { ColoredString::normal(curr_dir_name) }
+        );
+        if ambiguous {
+            directory_text.push(ColoredString::colored(format!(": {}", selected_dir_num), Color::Red));
+            *selected_dir_num += 1;
+        }
+        if closed {
+            directory_text.push(ColoredString::colored(String::from(" +"), Color::DarkGray));
+        }
+        contents.push(directory_text);
+    
+        // do not continue deeper into tree if this directory is hidden
+        if closed {
+            return contents;
+        }
+    
+        // iterate through all child directories and load them as well
+        let dirs = &curr_dir.borrow().directories;
+        for (i, dir) in dirs.iter().enumerate() {
+            // next index will need pipe if it is not the last one in branch
+            let (begin, next) = if i == dirs.len() - 1 {
+                ("└─ ", "   ")
+            } else {
+                ("├─ ", "│  ")
+            };
+    
+            let inner_dir_content = self.load_tree_contents(selected_dir_num, dir.clone());
+    
+            let mut first = true;
+            for e in inner_dir_content {
+                let mut line = vec![ColoredString::normal(if first { first = false; begin } else { next }.to_string())];
+                for piece in e {
+                    line.push(piece);
+                }
+                contents.push(line);
+            }
+        }
+    
+        contents
+    }
+
+    fn load_dir_contents(&self) -> Vec<Vec<ColoredString>> {
+        let mut contents = vec![];
+        contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
+        contents.push(vec![ColoredString::normal("-------------           ----  ----".to_string())]);
+    
+        if self.curr_dir.borrow().directories.len() != 0 {
+            contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
+    
+            for dir in &self.curr_dir.borrow().directories {
+                let last_mod = DateTime::<Utc>::from(dir.borrow().meta.modified().unwrap());
+    
+                let (pm, hour) = last_mod.hour12();
+                contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
+                    last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
+                    hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
+                    dir.borrow().name.to_str().unwrap()))]);                            // file name
+            }
+            contents.push(vec![ColoredString::normal(String::new())]);
+        }
+    
+        if self.curr_dir.borrow().files.len() != 0 {
+            contents.push(vec![ColoredString::normal("- Files -".to_string())]);
+    
+            for file in &self.curr_dir.borrow().files {
+                let last_mod = DateTime::<Utc>::from(file.borrow().meta.modified().unwrap());
+    
+                let (pm, hour) = last_mod.hour12();
+                contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}  {:>7}  {}",
+                    last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
+                    hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
+                    file_size_to_str(file.borrow().meta.file_size()),                 // file size string
+                    file.borrow().name.to_str().unwrap()))]);                           // file name
+            }
+        }
+    
+        contents
+    }
+
+    // reloads contents of (and redraws) the specified areas
+    fn refresh_area(&mut self, tree: bool, contents: bool) -> io::Result<()> {
+        if tree {
+            let contents = self.load_tree_contents(&mut 0, self.root.clone());
+            self.tree.longest_line_len = contents.iter()
+                .fold(0, |largest, line| max(largest, line.iter()
+                    .fold(0, |len, piece| len + piece.string.chars().count())));
+            self.tree.contents = contents;
+            self.tree.draw(self.term)?;
+        }
+        if contents {
+            let contents = self.load_dir_contents();
+            self.dir_contents.longest_line_len = contents.iter()
+                .fold(0, |largest, line| max(largest, line.iter()
+                    .fold(0, |len, piece| len + piece.string.chars().count())));
+            self.dir_contents.contents = contents;
+            self.dir_contents.draw(self.term)?;
+        }
+
+        Ok(())
+    }
+
+    // returns a list of possible directories which match the searched name/path
+    fn to_directory(&self, path: &str) -> Vec<DirectoryRef> {
+        let parts: Vec<&str> = path.split("/").collect();
+        
+        // narrows down the possible valid directories part by part of the path specified
+        let mut possible = vec![self.root.clone()];
+        for part in &parts {
+            let mut new: Vec<DirectoryRef> = vec![];
+            for dir in &possible {
+                self.to_directory_helper(part, dir.clone(), &mut new);
+            }
+            possible = new;
+        }
+        
+        possible
+    }
+    
+    // recursively goes through each directory in the tree and returns all matches
+    fn to_directory_helper(&self, path: &str, curr_dir: DirectoryRef, possible: &mut Vec<DirectoryRef>) {
+        if curr_dir.borrow().name == path {
+            possible.push(curr_dir.clone());
+        }
+        if self.closed_dirs.contains(&curr_dir) {
+            return;
+        }
+
+        let clone = curr_dir.clone();
+        for dir in &clone.borrow().directories {
+            self.to_directory_helper(path, dir.clone(), possible);
+        }
+    }
+
+    
 }
 
 fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
@@ -614,101 +840,6 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     Ok(())
 }
 
-fn load_tree_contents(
-    selected_dir: DirectoryRef,
-    ambiguous_dirs: &Vec<DirectoryRef>,
-    hidden_dirs: &Vec<DirectoryRef>,
-    selected_dir_num: &mut i32, // counter for when multiple directories are selected, to display each with own number
-    curr_dir: DirectoryRef,    // current dir being processed
-) -> Vec<Vec<ColoredString>>
-{
-    let mut contents = vec![];
-
-    let curr_dir_name: String = curr_dir.borrow().name.clone().into_string().unwrap();
-
-    let mut hidden = false;
-    // print item with correct color
-    contents.push(vec![
-        if ambiguous_dirs.iter().any(|e| *e == curr_dir) {   // red
-            let text = format!("{}: {}", curr_dir_name, selected_dir_num);
-            *selected_dir_num += 1;
-            ColoredString::colored(text, Color::Red)
-        } else if hidden_dirs.iter().any(|e| *e == curr_dir) {   // gray
-            hidden = true;
-            ColoredString::colored(format!("{} +", curr_dir_name), Color::DarkGray)
-        } else if curr_dir == selected_dir {   // blue
-            ColoredString::colored(curr_dir_name, Color::Blue)
-        } else {   // normal
-            ColoredString::normal(curr_dir_name)
-        }]);
-
-    if hidden {
-        return contents;
-    }
-
-    // iterate through all child directories and load them as well
-    let dirs = &curr_dir.borrow().directories;
-    for (i, dir) in dirs.iter().enumerate() {
-        // next index will need pipe if it is not the last one in branch
-        let (begin, next) = if i == dirs.len() - 1 {
-            ("└─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
-        };
-
-        let inner_dir_content = load_tree_contents(selected_dir.clone(), ambiguous_dirs, hidden_dirs, selected_dir_num, dir.clone());
-
-        let mut first = true;
-        for e in inner_dir_content {
-            let mut line = vec![ColoredString::normal(if first { first = false; begin } else { next }.to_string())];
-            for piece in e {
-                line.push(piece);
-            }
-            contents.push(line);
-        }
-    }
-
-    contents
-}
-
-fn load_dir_contents(curr_dir: DirectoryRef) -> Vec<Vec<ColoredString>> {
-    let mut contents = vec![];
-    contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
-    contents.push(vec![ColoredString::normal("-------------           ----  ----".to_string())]);
-
-    if curr_dir.borrow().directories.len() != 0 {
-        contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
-
-        for dir in &curr_dir.borrow().directories {
-            let last_mod = DateTime::<Utc>::from(dir.borrow().meta.modified().unwrap());
-
-            let (pm, hour) = last_mod.hour12();
-            contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
-                last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
-                hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
-                dir.borrow().name.to_str().unwrap()))]);                            // file name
-        }
-        contents.push(vec![ColoredString::normal(String::new())]);
-    }
-
-    if curr_dir.borrow().files.len() != 0 {
-        contents.push(vec![ColoredString::normal("- Files -".to_string())]);
-
-        for file in &curr_dir.borrow().files {
-            let last_mod = DateTime::<Utc>::from(file.borrow().meta.modified().unwrap());
-
-            let (pm, hour) = last_mod.hour12();
-            contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}  {:>7}  {}",
-                last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
-                hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
-                file_size_to_str(file.borrow().meta.file_size()),                 // file size string
-                file.borrow().name.to_str().unwrap()))]);                           // file name
-        }
-    }
-
-    contents
-}
-
 fn file_size_to_str(size: u64) -> String {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -725,6 +856,24 @@ fn file_size_to_str(size: u64) -> String {
     }
 }
 
+fn load_dir(dir_path: PathBuf) -> io::Result<DirectoryRef> {
+    let mut files: Vec<FileRef> = vec![];
+    let mut directories: Vec<DirectoryRef> = vec![];
+
+    for entry in fs::read_dir(&dir_path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        
+        if entry.file_type()?.is_dir() {
+            directories.push(load_dir(entry_path)?);
+        } else {
+            files.push(Rc::new(RefCell::new(File::new(entry.path()))));
+        }
+    }
+
+    Ok(Rc::new(RefCell::new(Directory::new(dir_path, files, directories))))
+}
+
 fn main() -> io::Result<()> {
     // parse command line arguments and extract directory
     // let path = PathBuf::from(env::args().nth(1).expect("Usage: dirman <directory>"));
@@ -732,7 +881,6 @@ fn main() -> io::Result<()> {
     if !path.is_dir() {
         panic!("Input directory does not exist");
     }
-    
 
     // construct directory tree
     let root = load_dir(path)?;
@@ -742,57 +890,12 @@ fn main() -> io::Result<()> {
     // find dimensions for screen areas
     let size = Vector2 { x: term.size().1 as usize, y: term.size().0 as usize };
 
-    let line_x = (size.x as f64 * 0.5) as usize;
-
-    let tree_contents = load_tree_contents(root.clone(), &vec![], &vec![], &mut 0, root.clone());
-    let tree_area = ScrollableArea {
-        screen_offset: Vector2 { x: 0, y: 2 },
-        size: Vector2 { x: line_x, y: size.y - 4 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-        longest_line_len: tree_contents.iter()
-            .fold(0, |largest, line| max(largest, line.iter()
-                .fold(0, |len, piece| len + piece.string.chars().count()))),
-        contents: tree_contents,
-    };
-
-    let dir_contents = load_dir_contents(root.clone());
-    let contents_area = ScrollableArea {
-        screen_offset: Vector2 { x: line_x + 1, y: 2 },
-        size: Vector2 { x: (size.x - line_x - 1), y: size.y - 4 },
-        curr_pos: Vector2 { x: 0, y: 0 },
-        longest_line_len: dir_contents.iter()
-            .fold(0, |largest, line| max(largest, line.iter()
-                .fold(0, |acc, piece| acc + piece.string.chars().count()))),
-        contents: dir_contents,
-    };
-
-    // let command_area = ScrollableArea {
-    //     screen_offset: Vector2 { x: 3, y: size.y - 2 },
-    //     size: Vector2 { x: size.x - 3, y: 1 },
-    //     curr_pos: Vector2 { x: 0, y: 0 },
-    //     contents: vec![],
-    //     longest_line_len: 0,
-    // };
-
-    let mut manager = StateManager {
-        term: &term,
-        root: root.clone(),
-        curr_dir: root.clone(),
-        hidden_dirs: vec![],
-        ambiguous_dirs: vec![],
-        command_buf: None,
-        tree: tree_area,
-        dir_contents: contents_area,
-    };
-
     for _ in 0..size.y {
         term.write_line("")?;
     }
-
     draw_outline(&term, CurrentArea::Command)?;
 
-    manager.tree.draw(&term)?;
-    manager.dir_contents.draw(&term)?;
+    let mut manager = StateManager::init(&term, root)?;
 
     term.move_cursor_to(3, size.y - 1)?;
 
@@ -890,22 +993,4 @@ fn main() -> io::Result<()> {
     term.clear_screen()?;
 
     Ok(())
-}
-
-fn load_dir(dir_path: PathBuf) -> io::Result<DirectoryRef> {
-    let mut files: Vec<FileRef> = vec![];
-    let mut directories: Vec<DirectoryRef> = vec![];
-
-    for entry in fs::read_dir(&dir_path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        
-        if entry.file_type()?.is_dir() {
-            directories.push(load_dir(entry_path)?);
-        } else {
-            files.push(Rc::new(RefCell::new(File::new(entry.path()))));
-        }
-    }
-
-    Ok(Rc::new(RefCell::new(Directory::new(dir_path, files, directories))))
 }
