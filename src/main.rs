@@ -2,13 +2,14 @@ use std::env;
 use std::fs::{self, Metadata};
 use std::os::windows::prelude::*;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::io::{self, Write};
 use std::ops::{Add, AddAssign, Sub};
 use std::cmp::{PartialEq, max, min};
 use std::cell::RefCell;
 use std::rc::Rc;
 use console::Term;
+use crossterm::event::{self, Event};
 use chrono::{DateTime, Utc, Datelike, Timelike};
 use colorful::Color;
 use colorful::Colorful;
@@ -50,19 +51,11 @@ impl Sub for Vector2 {
     }
 }
 
+// struct for data relevant to a file in the directory
 struct File {
     name: OsString,
     meta: Metadata,
     full_path: PathBuf,
-}
-
-struct Directory {
-    name: OsString,
-    meta: Metadata,
-    full_path: PathBuf,
-    files: Vec<FileRef>,
-    directories: Vec<DirectoryRef>,
-    parent: Option<DirectoryRef>,
 }
 
 impl File {
@@ -73,6 +66,16 @@ impl File {
             full_path: path,
         }
     }
+}
+
+// struct for data relevant to a directory
+struct Directory {
+    name: OsString,
+    meta: Metadata,
+    full_path: PathBuf,
+    files: Vec<FileRef>,
+    directories: Vec<DirectoryRef>,
+    parent: Option<DirectoryRef>,
 }
 
 impl Directory {
@@ -118,6 +121,7 @@ impl ColoredString {
     }
 }
 
+// an area in the terminal window which can be drawn to
 struct ScrollableArea {
     screen_offset: Vector2,  // the location on the terminal window of the top left of this area
     size: Vector2,           // the size of the area
@@ -261,19 +265,30 @@ type CommandProcedure<'a> = fn(&mut StateManager<'a>, DirQuery, &str) -> io::Res
 
 // object which manages 'global' state of the program
 struct StateManager<'a> {
+    // reference to terminal for output
     term: &'a Term,
+    // root directory (where program was started)
     root: DirectoryRef,
+    // currently selected directory
     curr_dir: DirectoryRef,
+    // directories which have been closed by user
     closed_dirs: Vec<DirectoryRef>,
+    // all possible directories which could match ambiguous query
     ambiguous_dirs: Vec<DirectoryRef>,
+    // maybe buffered command (to remember which command was called in the case of ambiguity)
     command_buf: Option<(CommandProcedure<'a>, String)>,
+    // flag for whether an error message was printed in prior command
     error_message_active: bool,
+    // buffer for a directory to be removed as user is asked to confirm if directory removal was intended
     dir_to_remove: Option<DirectoryRef>,
+    // drawing area for directory tree
     tree: ScrollableArea,
+    // drawing area for contents of currently selected directory
     dir_contents: ScrollableArea,
 }
 
 impl<'a> StateManager<'a> {
+    // returns a new instance of the StateManager with all needed values initialized
     fn init(term: &'a Term, root: DirectoryRef) -> io::Result<Self> {
         let term_size = Vector2 { x: term.size().1 as usize, y: term.size().0 as usize };
         let line_x = (term_size.x as f64 * 0.5) as usize;
@@ -588,6 +603,7 @@ impl<'a> StateManager<'a> {
     fn enter_dir(&mut self, dir: DirQuery, other_arg: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::enter_dir, dir, other_arg)? {
             self.curr_dir = dir;
+            self.dir_contents.curr_pos = Vector2 { x: 0, y: 0 };
             self.refresh_area(true, true)?;
         }
         Ok(())
@@ -604,6 +620,7 @@ impl<'a> StateManager<'a> {
                .contains(dir.borrow().full_path.to_str().unwrap())
             {
                 self.curr_dir = dir;
+                self.dir_contents.curr_pos = Vector2 { x: 0, y: 0 };
             }
 
             self.refresh_area(true, true)?;
@@ -717,6 +734,7 @@ impl<'a> StateManager<'a> {
                    .contains(dir.borrow().full_path.to_str().unwrap())
                 {
                     self.curr_dir = parent.clone();
+                    self.dir_contents.curr_pos = Vector2 { x: 0, y: 0 };
                 }
 
                 self.dir_to_remove = None;
@@ -892,20 +910,21 @@ impl<'a> StateManager<'a> {
 
     // reloads contents of (and redraws) the specified areas
     fn refresh_area(&mut self, tree: bool, contents: bool) -> io::Result<()> {
+        // function to refresh an individual area (with new contents specified)
         fn refresh(term: &Term, area: &mut ScrollableArea, new_contents: Vec<Vec<ColoredString>>) -> io::Result<()> {
             let new_width = new_contents.iter()
                 .fold(0, |largest, line| max(largest, line.iter()
                     .fold(0, |len, piece| len + piece.string.chars().count())));
             let new_height = new_contents.len();
 
-            let farthest_right = area.curr_pos.x + area.size.x;
-            if farthest_right > new_width {
-                area.curr_pos.x -= farthest_right - new_width;
+            let window_farthest_right = area.curr_pos.x + area.contents_size().x;
+            if new_width < window_farthest_right {
+                area.curr_pos.x -= min(area.curr_pos.x, window_farthest_right - new_width);
             }
 
-            let farthest_down = area.curr_pos.y + area.size.y;
-            if farthest_down > new_height {
-                area.curr_pos.x -= farthest_down - new_height;
+            let window_farthest_down = area.curr_pos.y + area.contents_size().y;
+            if new_height < window_farthest_down {
+                area.curr_pos.y -= min(area.curr_pos.y, window_farthest_down - new_height);
             }
 
             area.longest_line_len = new_width;
@@ -917,39 +936,11 @@ impl<'a> StateManager<'a> {
         if tree {
             let contents = self.load_tree_contents(&mut 0, self.root.clone());
             refresh(self.term, &mut self.tree, contents)?;
-            // let new_contents = self.load_tree_contents(&mut 0, self.root.clone());
-
-            // let tree = &mut self.tree;
-            // let new_width = new_contents.iter()
-            //     .fold(0, |largest, line| max(largest, line.iter()
-            //         .fold(0, |len, piece| len + piece.string.chars().count())));
-            // let new_height = new_contents.len();
-
-            // let farthest_right = tree.curr_pos.x + tree.size.x;
-            // if farthest_right > new_width {
-            //     tree.curr_pos.x -= farthest_right - new_width;
-            // }
-
-            // let farthest_down = tree.curr_pos.y + tree.size.y;
-            // if farthest_down > new_height {
-            //     tree.curr_pos.x -= farthest_down - new_height;
-            // }
-
-            // tree.longest_line_len = new_width;
-            // tree.contents = new_contents;
-            // tree.draw(self.term)?;
         }
         if contents {
             let contents = self.load_dir_contents();
-            refresh(self.term, &mut self.tree, contents)?;
-            // let contents = self.load_dir_contents();
-            // self.dir_contents.longest_line_len = contents.iter()
-            //     .fold(0, |largest, line| max(largest, line.iter()
-            //         .fold(0, |len, piece| len + piece.string.chars().count())));
-            // self.dir_contents.contents = contents;
-            // self.dir_contents.draw(self.term)?;
+            refresh(self.term, &mut self.dir_contents, contents)?;
         }
-        // TODO scroll up/left if needed
 
         Ok(())
     }
@@ -985,10 +976,9 @@ impl<'a> StateManager<'a> {
             self.to_directory_helper(path, dir.clone(), possible);
         }
     }
-
-    
 }
 
+// draws borders around each area of the window
 fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     let (height, width) = {
         let size = term.size();
@@ -1037,7 +1027,7 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     }
     term.write_line("")?;
 
-    print!(" > ");
+    term.write_str(" > ")?;
     io::stdout().flush()?;
 
     Ok(())
@@ -1112,92 +1102,114 @@ fn main() -> io::Result<()> {
     
     let mut command = String::new();
     loop {
-        let key = term.read_key()?;
+        match event::read().unwrap() {
+            Event::Resize(width, height) => {
+                let (width, height) = (width as usize, height as usize);
 
-        // TODO handle resize https://docs.rs/crossterm/0.17.7/crossterm/event/fn.poll.html
-        use console::Key::*;
-        match key {
-            ArrowUp => {
-                if let CurrentArea::Command = curr_area_tag {
-                    curr_area_tag = CurrentArea::Tree;
-                    draw_outline(&term, CurrentArea::Tree)?;
-                    term.hide_cursor()?;
-                }
+                let line_x = width / 2;
+                manager.tree.size = Vector2 { x: line_x, y: height - 4 };
+                manager.dir_contents.size = Vector2 { x: width - line_x - 1, y: height - 4 };
+                manager.dir_contents.screen_offset = Vector2 { x: line_x + 1, y: 2 };
+                manager.refresh_area(true, true)?;
             },
-            ArrowRight => {
-                if let CurrentArea::Tree = curr_area_tag {
-                    curr_area_tag = CurrentArea::Contents;
-                    draw_outline(&term, CurrentArea::Contents)?;
-                }
-            },
-            ArrowDown | Escape => {
-                if curr_area_tag != CurrentArea::Command {
-                    curr_area_tag = CurrentArea::Command;
-                    draw_outline(&term, CurrentArea::Command)?;
-                    term.show_cursor()?;
-                }
-            },
-            ArrowLeft => {
-                if let CurrentArea::Contents = curr_area_tag {
-                    curr_area_tag = CurrentArea::Tree;
-                    draw_outline(&term, CurrentArea::Tree)?;
-                }
-            },
-            Char(c) => {
-                if let CurrentArea::Command = curr_area_tag {
-                    command.push(c);
-                    term.write_str(&c.to_string())?;
-                } else {
-                    let curr_area = match curr_area_tag {
-                        CurrentArea::Tree => &mut manager.tree,
-                        CurrentArea::Contents => &mut manager.dir_contents,
-                        _ => &mut manager.tree,
-                    };
+            Event::Key(key_event) => {
+                let key = key_event.code;
+                // TODO handle resize https://docs.rs/crossterm/0.17.7/crossterm/event/fn.poll.html
+                use crossterm::event::KeyCode::*;
+                match key {
+                    Up => {
+                        if let CurrentArea::Command = curr_area_tag {
+                            curr_area_tag = CurrentArea::Tree;
+                            draw_outline(&term, CurrentArea::Tree)?;
+                            term.hide_cursor()?;
+                        }
+                    },
+                    Right => {
+                        if let CurrentArea::Tree = curr_area_tag {
+                            curr_area_tag = CurrentArea::Contents;
+                            draw_outline(&term, CurrentArea::Contents)?;
+                        }
+                    },
+                    Down | Esc => {
+                        if curr_area_tag != CurrentArea::Command {
+                            curr_area_tag = CurrentArea::Command;
+                            draw_outline(&term, CurrentArea::Command)?;
+                            term.move_cursor_right(command.chars().count())?;
+                            term.show_cursor()?;
+                        }
+                    },
+                    Left => {
+                        if let CurrentArea::Contents = curr_area_tag {
+                            curr_area_tag = CurrentArea::Tree;
+                            draw_outline(&term, CurrentArea::Tree)?;
+                        }
+                    },
+                    Char(c) => {
+                        if let CurrentArea::Command = curr_area_tag {
+                            command.push(c);
+                            term.write_str(&c.to_string())?;
+                        } else {
+                            let curr_area = match curr_area_tag {
+                                CurrentArea::Tree => &mut manager.tree,
+                                CurrentArea::Contents => &mut manager.dir_contents,
+                                _ => &mut manager.tree,
+                            };
 
-                    match c {
-                        'w' | 'W' => if curr_area.curr_pos.y != 0 {
-                            curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
-                            curr_area.draw(&term)?;
-                        },
-                        'a' | 'A' => if curr_area.curr_pos.x != 0 {
-                            curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
-                            curr_area.draw(&term)?;
-                        },
-                        's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
-                            curr_area.curr_pos.y += min(
-                                curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
-                                5);
-                            curr_area.draw(&term)?;
-                        },
-                        'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
-                            curr_area.curr_pos.x += min(
-                                curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
-                                5);
-                            curr_area.draw(&term)?;
-                        },
-                        _ => {},
+                            match c {
+                                // WASD control scrolling if a scrollable area is selected
+                                'w' | 'W' => if curr_area.curr_pos.y != 0 {
+                                    curr_area.curr_pos.y -= min(curr_area.curr_pos.y, 5);
+                                    curr_area.draw(&term)?;
+                                },
+                                'a' | 'A' => if curr_area.curr_pos.x != 0 {
+                                    curr_area.curr_pos.x -= min(curr_area.curr_pos.x, 5);
+                                    curr_area.draw(&term)?;
+                                },
+                                's' | 'S' => if curr_area.contents_size().y + curr_area.curr_pos.y < curr_area.contents.len() {
+                                    curr_area.curr_pos.y += min(
+                                        curr_area.contents.len() - curr_area.contents_size().y - curr_area.curr_pos.y,
+                                        5);
+                                    curr_area.draw(&term)?;
+                                },
+                                'd' | 'D' => if curr_area.contents_size().x + curr_area.curr_pos.x < curr_area.longest_line_len {
+                                    curr_area.curr_pos.x += min(
+                                        curr_area.longest_line_len - curr_area.contents_size().x - curr_area.curr_pos.x,
+                                        5);
+                                    curr_area.draw(&term)?;
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    Enter => {
+                        if command == "q" {
+                            break;
+                        }
+                        
+                        manager.process_command(&command)?;
+
+                        let num_chars = command.chars().count();
+                        term.move_cursor_to(3 + num_chars, manager.term.size().0 as usize - 1)?;
+                        term.clear_chars(num_chars)?;
+                        
+                        command.clear();
                     }
+                    Backspace => {
+                        if command.chars().count() != 0 {
+                            command.pop();
+                            term.clear_chars(1)?;
+                        }
+                    }
+                    _ => {},
                 }
-            },
-            Enter => {
-                if command == "q" {
-                    break;
-                }
-                
-                manager.process_command(&command)?;
-                manager.term.move_cursor_to(3, manager.term.size().0 as usize - 1)?;
-                let chars = command.chars().count();
-                term.move_cursor_right(chars)?;
-                term.clear_chars(command.chars().count())?;
-                
-                command.clear();
-            }
-            Backspace => {
-                command.pop();
-                term.clear_chars(1)?;
             }
             _ => {},
         }
+        //let key = term.read_key()?;
+
+
+
+        
     }
     term.clear_screen()?;
 
