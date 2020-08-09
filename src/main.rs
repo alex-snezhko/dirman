@@ -3,7 +3,7 @@ use std::fs::{self, Metadata};
 use std::os::windows::prelude::*;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::io::{self, Write};
+use std::io;
 use std::ops::{Add, AddAssign, Sub};
 use std::cmp::{PartialEq, max, min};
 use std::cell::RefCell;
@@ -1025,10 +1025,7 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     for _ in line_x+1..width {
         print_with_color("━", vec![Contents, Command])?;
     }
-    term.write_line("")?;
-
-    term.write_str(" > ")?;
-    io::stdout().flush()?;
+    term.move_cursor_down(1)?;
 
     Ok(())
 }
@@ -1092,7 +1089,10 @@ fn main() -> io::Result<()> {
     for _ in 0..=size.y {
         term.write_line("")?;
     }
+
     draw_outline(&term, CurrentArea::Command)?;
+    term.clear_line()?;
+    term.write_str(" > ")?;
 
     let mut manager = StateManager::init(&term, root.clone())?;
 
@@ -1110,11 +1110,16 @@ fn main() -> io::Result<()> {
                 manager.tree.size = Vector2 { x: line_x, y: height - 4 };
                 manager.dir_contents.size = Vector2 { x: width - line_x - 1, y: height - 4 };
                 manager.dir_contents.screen_offset = Vector2 { x: line_x + 1, y: 2 };
+
+                draw_outline(&term, curr_area_tag)?;
+                term.clear_line()?;
+                term.write_str(" > ")?;
+                term.write_str(&command)?;
                 manager.refresh_area(true, true)?;
+                term.move_cursor_to(3 + command.chars().count(), height - 1)?;
             },
             Event::Key(key_event) => {
                 let key = key_event.code;
-                // TODO handle resize https://docs.rs/crossterm/0.17.7/crossterm/event/fn.poll.html
                 use crossterm::event::KeyCode::*;
                 match key {
                     Up => {
@@ -1134,7 +1139,7 @@ fn main() -> io::Result<()> {
                         if curr_area_tag != CurrentArea::Command {
                             curr_area_tag = CurrentArea::Command;
                             draw_outline(&term, CurrentArea::Command)?;
-                            term.move_cursor_right(command.chars().count())?;
+                            term.move_cursor_right(3 + command.chars().count())?;
                             term.show_cursor()?;
                         }
                     },
