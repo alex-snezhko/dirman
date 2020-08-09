@@ -8,7 +8,7 @@ use std::ops::{Add, AddAssign, Sub};
 use std::cmp::{PartialEq, max, min};
 use std::cell::RefCell;
 use std::rc::Rc;
-use console::{Term, Style};
+use console::Term;
 use chrono::{DateTime, Utc, Datelike, Timelike};
 use colorful::Color;
 use colorful::Colorful;
@@ -62,6 +62,7 @@ struct Directory {
     full_path: PathBuf,
     files: Vec<FileRef>,
     directories: Vec<DirectoryRef>,
+    parent: Option<DirectoryRef>,
 }
 
 impl File {
@@ -75,13 +76,20 @@ impl File {
 }
 
 impl Directory {
-    fn new(path: PathBuf, files: Vec<FileRef>, directories: Vec<DirectoryRef>) -> Self {
+    fn new(
+        path: PathBuf,
+        files: Vec<FileRef>,
+        directories: Vec<DirectoryRef>,
+        parent: Option<DirectoryRef>
+    ) -> Self
+    {
         Self {
             name: OsString::from(path.file_name().unwrap()),
             meta: path.metadata().unwrap(),
             full_path: path,
             files,
             directories,
+            parent,
         }
     }
 }
@@ -146,27 +154,30 @@ impl ScrollableArea {
             // bounds that arrows may be drawn in will be 1 unit away from edges
             let s = self.size - Vector2 { x: 2, y: 2 };
 
+            const X_EVERY: usize = 5;
+            const Y_EVERY: usize = 3;
+
             use ArrowLocation::*;
             // begin_offset determines where to place the terminal cursor for the first arrow
             // in the sequence; it is calculated by the principle that as many arrows should be
             // drawn as can fit in the bounds; the complex calculation involves finding the size of
             // the "line" of arrows to be drawn (including one extra as fence-post) and centering it
             let (arrow, horizontal, begin_offset, count) = match direction {
-                Top => ("↑", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / 4) * 4 + 1)) / 2, y: 0 }, (s.x - 1) / 4 + 1),
-                Right => ("→", false, Vector2 { x: s.x + 1, y: 1 + (s.y - (((s.y - 1) / 2) * 2 + 1)) / 2 }, (s.y - 1) / 2 + 1),
-                Bottom =>  ("↓", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / 4) * 4 + 1)) / 2, y: s.y + 1 }, (s.x - 1) / 4 + 1),
-                Left => ("←", false, Vector2 { x: 0, y: 1 + (s.y - (((s.y - 1) / 2) * 2 + 1)) / 2 }, (s.y - 1) / 2 + 1),
+                Top => ("↑", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / X_EVERY) * X_EVERY + 1)) / 2, y: 0 }, (s.x - 1) / X_EVERY + 1),
+                Right => ("→", false, Vector2 { x: s.x + 1, y: 1 + (s.y - (((s.y - 1) / Y_EVERY) * Y_EVERY + 1)) / 2 }, (s.y - 1) / Y_EVERY + 1),
+                Bottom =>  ("↓", true, Vector2 { x: 1 + (s.x - (((s.x - 1) / X_EVERY) * X_EVERY + 1)) / 2, y: s.y + 1 }, (s.x - 1) / X_EVERY + 1),
+                Left => ("←", false, Vector2 { x: 0, y: 1 + (s.y - (((s.y - 1) / Y_EVERY) * Y_EVERY + 1)) / 2 }, (s.y - 1) / Y_EVERY + 1),
             };
 
             let mut pos = self.screen_offset + begin_offset;
             for _ in 0..count {
                 term.move_cursor_to(pos.x, pos.y)?;
-                term.write_str(arrow)?;
+                term.write_str(&format!("{}", arrow.color(Color::DarkGray)))?;
 
                 if horizontal {
-                    pos.x += 4;
+                    pos.x += X_EVERY;
                 } else {
-                    pos.y += 2;
+                    pos.y += Y_EVERY;
                 }
             }
             Ok(())
@@ -257,6 +268,7 @@ struct StateManager<'a> {
     ambiguous_dirs: Vec<DirectoryRef>,
     command_buf: Option<(CommandProcedure<'a>, String)>,
     error_message_active: bool,
+    dir_to_remove: Option<DirectoryRef>,
     tree: ScrollableArea,
     dir_contents: ScrollableArea,
 }
@@ -290,6 +302,7 @@ impl<'a> StateManager<'a> {
             ambiguous_dirs: vec![],
             command_buf: None,
             error_message_active: false,
+            dir_to_remove: None,
             tree: tree_area,
             dir_contents: contents_area,
         };
@@ -310,6 +323,23 @@ impl<'a> StateManager<'a> {
         // initially assume no error; if no error message is printed from this command then clear
         // the error message (if there is one)
         self.error_message_active = false;
+
+        if self.dir_to_remove.is_some() {
+            if tokens.len() == 1 {
+                if tokens[0] == "yes" {
+                    self.clear_error()?;
+                    self.remove_dir(DirQuery::Disambiguated(self.dir_to_remove.clone().unwrap()), "")?;
+                    return Ok(());
+                } else if tokens[0] == "no" {
+                    self.clear_error()?;
+                    self.command_buf = None;
+                    self.dir_to_remove = None;
+                    self.refresh_area(true, false)?;
+                    return Ok(());
+                }
+            }
+            self.print_error("Input either 'yes' or 'no' for removal of directory and its contents")?;
+        }
 
         // this condition is true if there is disambiguation needed
         if self.command_buf.is_some() {
@@ -344,6 +374,7 @@ impl<'a> StateManager<'a> {
         }
 
         match tokens[0] {
+            // enter <directory>
             "enter" => {
                 if tokens.len() == 2 {
                     self.enter_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
@@ -352,6 +383,7 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // open <directory>
             "open" => {
                 if tokens.len() == 2 {
                     self.open_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
@@ -360,6 +392,7 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // close <directory>
             "close" => {
                 if tokens.len() == 2 {
                     self.close_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
@@ -368,6 +401,7 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // move <file> <directory>
             "move" => {
                 if tokens.len() == 3 {
                     if self.curr_dir.borrow().files.iter().any(|e| e.borrow().name == tokens[1]) {
@@ -380,6 +414,7 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // copy <file> <directory>
             "copy" => {
                 if tokens.len() == 3 {
                     if self.curr_dir.borrow().files.iter().any(|e| e.borrow().name == tokens[1]) {
@@ -392,12 +427,26 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // rename <file|directory> <new_name>
             "rename" => {
                 if tokens.len() == 3 {
-                    if let Some(old_file) = self.curr_dir.clone().borrow().files.iter().find(|e| e.borrow().name == tokens[1]) {
+                    let maybe_old_file_index: Option<usize> = self.curr_dir
+                        .clone()
+                        .borrow()
+                        .files.iter()
+                        .position(|e| e.borrow().name == tokens[1]);
+
+                    if let Some(old_file_index) = maybe_old_file_index {
                         let mut new_path = self.curr_dir.borrow().full_path.clone();
                         new_path.push(tokens[2]);
-                        fs::rename(&old_file.borrow().full_path, new_path)?;
+
+                        fs::rename(&self.curr_dir.borrow().files[old_file_index].borrow().full_path, &new_path)?;
+
+                        // remove the file from the tree and add the new one
+                        self.curr_dir.borrow_mut().files.remove(old_file_index);
+                        Self::add_item_to_tree(self.curr_dir.clone(), new_path);
+
+                        self.refresh_area(false, true)?;
                     } else {
                         self.rename_dir(DirQuery::ByName(tokens[1].to_string()), tokens[2])?;
                     }
@@ -406,6 +455,7 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // new [file|directory] <name>
             // creates a new file or directory in the current directory
             "new" => {
                 if tokens.len() == 3 {
@@ -416,10 +466,16 @@ impl<'a> StateManager<'a> {
                         if !new_path.exists() {
                             if which == "file" {
                                 fs::File::create(&new_path)?;
-                                Self::add_file(self.curr_dir.clone(), new_path);
-                                // TODO place in correct directory and make sure it gets created
+                                Self::add_item_to_tree(self.curr_dir.clone(), new_path);
                             } else {
-                                fs::create_dir(new_path)?;
+                                fs::create_dir(&new_path)?;
+                                let new_dir = Rc::new(RefCell::new(
+                                    Directory::new(new_path, vec![], vec![], Some(self.curr_dir.clone())))
+                                );
+
+                                self.curr_dir.borrow_mut().directories.push(new_dir);
+                                self.curr_dir.borrow_mut().directories.sort_by(|x, y| x.borrow().name.cmp(&y.borrow().name));
+
                                 self.refresh_area(true, false)?;
                             }
                             self.refresh_area(false, true)?;
@@ -432,8 +488,20 @@ impl<'a> StateManager<'a> {
                 }
             },
 
+            // remove <file|directory>
             "remove" => {
-
+                if tokens.len() == 2 {
+                    let maybe_file_index = self.curr_dir.borrow().files.iter().position(|e| e.borrow().name == tokens[1]);
+                    if let Some(file_index) = maybe_file_index {
+                        fs::remove_file(&self.curr_dir.borrow().files[file_index].borrow().full_path)?;
+                        self.curr_dir.borrow_mut().files.remove(file_index);
+                        self.refresh_area(false, true)?;
+                    } else {
+                        self.remove_dir(DirQuery::ByName(tokens[1].to_string()), "")?;
+                    }
+                } else {
+                    self.print_error("Usage: remove <file|directory>")?;
+                }
             }
 
             _ => {
@@ -473,20 +541,11 @@ impl<'a> StateManager<'a> {
     }
 
     // adds a file to the in-memory directory tree data structure
-    fn add_file(dir: DirectoryRef, path: PathBuf) {
+    fn add_item_to_tree(dir: DirectoryRef, path: PathBuf) {
+        // files/dirs are kept sorted
         let files = &mut dir.borrow_mut().files;
-
-        let mut low = 0;
-        let mut high = files.len() - 1;
-        while low != high {
-            let mid = (high + low) / 2;
-            if files[mid].borrow().name > path {
-                high = mid;
-            } else {
-                low = mid;
-            }
-        }
-        files.insert(low, Rc::new(RefCell::new(File::new(path))));
+        files.push(Rc::new(RefCell::new(File::new(path))));
+        files.sort_by(|x, y| x.borrow().name.cmp(&y.borrow().name));
     }
 
     // +----------------------------------+
@@ -542,7 +601,7 @@ impl<'a> StateManager<'a> {
             // if the current directory is a child of the closed directory then move
             // the current directory up to the closed one
             if self.curr_dir.borrow().full_path.to_str().unwrap()
-            .contains(dir.borrow().full_path.to_str().unwrap())
+               .contains(dir.borrow().full_path.to_str().unwrap())
             {
                 self.curr_dir = dir;
             }
@@ -581,7 +640,7 @@ impl<'a> StateManager<'a> {
             self.curr_dir.borrow_mut().files.remove(index);
 
             // add this file to its new directory
-            Self::add_file(dir, new_path);
+            Self::add_item_to_tree(dir, new_path);
             self.refresh_area(false, true)?;
         }
 
@@ -599,17 +658,77 @@ impl<'a> StateManager<'a> {
             fs::copy(file_path, &new_path)?;
 
             // add this file to its new directory
-            Self::add_file(dir, new_path);
+            Self::add_item_to_tree(dir, new_path);
             self.refresh_area(false, true)?;
         }
 
         Ok(())
     }
 
-    // renames a file or directory
+    // renames a directory
     fn rename_dir(&mut self, dir: DirQuery, new_name: &str) -> io::Result<()> {
         if let Some(dir) = self.get_dir(Self::rename_dir, dir, new_name)? {
-            fs::rename(&dir.borrow().full_path, new_name)?;
+            // cannot rename root directory
+            if dir.borrow().parent.is_none() {
+                self.print_error("Cannot rename root directory")?;
+                return Ok(());
+            }
+
+            let mut new_path = dir.borrow().full_path.parent().unwrap().to_path_buf();
+            new_path.push(new_name);
+
+            fs::rename(&dir.borrow().full_path, &new_path)?;
+
+            dir.borrow_mut().name = OsString::from(new_name);
+            dir.borrow_mut().full_path = new_path;
+
+            // re-sort directories
+            if let Some(parent) = &dir.borrow().parent {
+                parent.borrow_mut().directories.sort_by(|x, y| x.borrow().name.cmp(&y.borrow().name));
+            }
+
+            self.refresh_area(true, true)?;
+        }
+
+        Ok(())
+    }
+
+    // removes a directory
+    fn remove_dir(&mut self, dir: DirQuery, other_arg: &str) -> io::Result<()> {
+        if let Some(dir) = self.get_dir(Self::remove_dir, dir, other_arg)? {
+            // cannot remove root directory
+            if dir.borrow().parent.is_none() {
+                self.print_error("Cannot remove root directory")?;
+                return Ok(());
+            }
+
+            if self.dir_to_remove.is_some() {
+                // dir_to_remove is just be dir at this point
+                fs::remove_dir_all(&dir.borrow().full_path)?;
+
+                let borrow = dir.borrow();
+                let parent = borrow.parent.as_ref().unwrap();
+
+                let index_to_remove = parent.borrow().directories.iter().position(|e| e == &dir).unwrap();
+
+                // if the current directory is a child of the closed directory then move
+                // the current directory up to the closed one
+                if self.curr_dir.borrow().full_path.to_str().unwrap()
+                   .contains(dir.borrow().full_path.to_str().unwrap())
+                {
+                    self.curr_dir = parent.clone();
+                }
+
+                self.dir_to_remove = None;
+
+                parent.borrow_mut().directories.remove(index_to_remove);
+                self.refresh_area(true, true)?;
+            } else {
+                self.print_error("The directory and all of its contents will be removed. Continue? yes/no")?;
+                self.dir_to_remove = Some(dir);
+            }
+
+            self.refresh_area(true, true)?;
         }
 
         Ok(())
@@ -646,20 +765,27 @@ impl<'a> StateManager<'a> {
         let curr_dir_name: String = curr_dir.borrow().name.clone().into_string().unwrap();
     
         // flags for what needs to be printed e.g. '<dir> +' and/or '<dir>: #' for closed/ambiguous
+        let mut remove = false;
         let mut closed = false;
         let mut ambiguous = false;
 
         // flag for which color to print the directory name in;
-        // precedence of current(blue) > ambiguous(red) > closed(gray) > normal(default color)
+        // precedence: current(blue) > remove(red) > ambiguous(green) > closed(gray) > normal(default color)
         let mut dir_name_color: Option<Color> = None;
         
         if curr_dir == self.curr_dir {
             dir_name_color = Some(Color::Blue);
         }
+        if self.dir_to_remove.is_some() && self.dir_to_remove.as_ref().unwrap() == &curr_dir {
+            remove = true;
+            if let None = dir_name_color {
+                dir_name_color = Some(Color::Red);
+            }
+        }
         if self.ambiguous_dirs.contains(&curr_dir) {
             ambiguous = true;
             if let None = dir_name_color {
-                dir_name_color = Some(Color::Red);
+                dir_name_color = Some(Color::Green);
             }
         }
         if self.closed_dirs.contains(&curr_dir) {
@@ -675,8 +801,11 @@ impl<'a> StateManager<'a> {
             if let Some(color) = dir_name_color { ColoredString::colored(curr_dir_name, color) }
             else { ColoredString::normal(curr_dir_name) }
         );
+        if remove {
+            directory_text.push(ColoredString::colored(String::from(" x"), Color::Red));
+        }
         if ambiguous {
-            directory_text.push(ColoredString::colored(format!(": {}", selected_dir_num), Color::Red));
+            directory_text.push(ColoredString::colored(format!(": {}", selected_dir_num), Color::Green));
             *selected_dir_num += 1;
         }
         if closed {
@@ -716,28 +845,21 @@ impl<'a> StateManager<'a> {
 
     fn load_dir_contents(&self) -> Vec<Vec<ColoredString>> {
         let mut contents = vec![];
-        contents.push(vec![ColoredString::normal("Last Modified           Size  Name".to_string())]);
-        contents.push(vec![ColoredString::normal("-------------           ----  ----".to_string())]);
-    
-        if self.curr_dir.borrow().directories.len() != 0 {
-            contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
-    
-            for dir in &self.curr_dir.borrow().directories {
-                let last_mod = DateTime::<Utc>::from(dir.borrow().meta.modified().unwrap());
-    
-                let (pm, hour) = last_mod.hour12();
-                contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
-                    last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
-                    hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
-                    dir.borrow().name.to_str().unwrap()))]);                            // file name
-            }
-            contents.push(vec![ColoredString::normal(String::new())]);
+
+        let files = &self.curr_dir.borrow().files;
+        let dirs = &self.curr_dir.borrow().directories;
+
+        if files.len() == 0 && dirs.len() == 0 {
+            contents.push(vec![ColoredString::normal("This directory is empty".to_string())]);
+        } else {
+            contents.push(vec![ColoredString::colored("Last Modified           Size  Name".to_string(), Color::Cyan)]);
+            contents.push(vec![ColoredString::colored("‾‾‾‾‾‾‾‾‾‾‾‾‾           ‾‾‾‾  ‾‾‾‾".to_string(), Color::Cyan)]);
         }
-    
-        if self.curr_dir.borrow().files.len() != 0 {
+
+        if files.len() != 0 {
             contents.push(vec![ColoredString::normal("- Files -".to_string())]);
     
-            for file in &self.curr_dir.borrow().files {
+            for file in files {
                 let last_mod = DateTime::<Utc>::from(file.borrow().meta.modified().unwrap());
     
                 let (pm, hour) = last_mod.hour12();
@@ -747,6 +869,22 @@ impl<'a> StateManager<'a> {
                     file_size_to_str(file.borrow().meta.file_size()),                 // file size string
                     file.borrow().name.to_str().unwrap()))]);                           // file name
             }
+            contents.push(vec![ColoredString::normal(String::new())]);
+        }
+
+        if dirs.len() != 0 {
+            contents.push(vec![ColoredString::normal("- Directories -".to_string())]);
+    
+            for dir in dirs {
+                let last_mod = DateTime::<Utc>::from(dir.borrow().meta.modified().unwrap());
+    
+                let (pm, hour) = last_mod.hour12();
+                contents.push(vec![ColoredString::normal(format!("{:02}/{:02}/{:02} {:02}:{:02} {}           {}",
+                    last_mod.month(), last_mod.day(), last_mod.year(),       // last modified date
+                    hour, last_mod.minute(), if pm { "PM" } else { "AM" },   // last modified time
+                    dir.borrow().name.to_str().unwrap()))]);                            // file name
+            }
+            
         }
     
         contents
@@ -754,22 +892,64 @@ impl<'a> StateManager<'a> {
 
     // reloads contents of (and redraws) the specified areas
     fn refresh_area(&mut self, tree: bool, contents: bool) -> io::Result<()> {
-        if tree {
-            let contents = self.load_tree_contents(&mut 0, self.root.clone());
-            self.tree.longest_line_len = contents.iter()
+        fn refresh(term: &Term, area: &mut ScrollableArea, new_contents: Vec<Vec<ColoredString>>) -> io::Result<()> {
+            let new_width = new_contents.iter()
                 .fold(0, |largest, line| max(largest, line.iter()
                     .fold(0, |len, piece| len + piece.string.chars().count())));
-            self.tree.contents = contents;
-            self.tree.draw(self.term)?;
+            let new_height = new_contents.len();
+
+            let farthest_right = area.curr_pos.x + area.size.x;
+            if farthest_right > new_width {
+                area.curr_pos.x -= farthest_right - new_width;
+            }
+
+            let farthest_down = area.curr_pos.y + area.size.y;
+            if farthest_down > new_height {
+                area.curr_pos.x -= farthest_down - new_height;
+            }
+
+            area.longest_line_len = new_width;
+            area.contents = new_contents;
+            area.draw(term)?;
+            Ok(())
+        }
+
+        if tree {
+            let contents = self.load_tree_contents(&mut 0, self.root.clone());
+            refresh(self.term, &mut self.tree, contents)?;
+            // let new_contents = self.load_tree_contents(&mut 0, self.root.clone());
+
+            // let tree = &mut self.tree;
+            // let new_width = new_contents.iter()
+            //     .fold(0, |largest, line| max(largest, line.iter()
+            //         .fold(0, |len, piece| len + piece.string.chars().count())));
+            // let new_height = new_contents.len();
+
+            // let farthest_right = tree.curr_pos.x + tree.size.x;
+            // if farthest_right > new_width {
+            //     tree.curr_pos.x -= farthest_right - new_width;
+            // }
+
+            // let farthest_down = tree.curr_pos.y + tree.size.y;
+            // if farthest_down > new_height {
+            //     tree.curr_pos.x -= farthest_down - new_height;
+            // }
+
+            // tree.longest_line_len = new_width;
+            // tree.contents = new_contents;
+            // tree.draw(self.term)?;
         }
         if contents {
             let contents = self.load_dir_contents();
-            self.dir_contents.longest_line_len = contents.iter()
-                .fold(0, |largest, line| max(largest, line.iter()
-                    .fold(0, |len, piece| len + piece.string.chars().count())));
-            self.dir_contents.contents = contents;
-            self.dir_contents.draw(self.term)?;
+            refresh(self.term, &mut self.tree, contents)?;
+            // let contents = self.load_dir_contents();
+            // self.dir_contents.longest_line_len = contents.iter()
+            //     .fold(0, |largest, line| max(largest, line.iter()
+            //         .fold(0, |len, piece| len + piece.string.chars().count())));
+            // self.dir_contents.contents = contents;
+            // self.dir_contents.draw(self.term)?;
         }
+        // TODO scroll up/left if needed
 
         Ok(())
     }
@@ -818,12 +998,12 @@ fn draw_outline(term: &Term, selected_panel: CurrentArea) -> io::Result<()> {
     let line_x = (width as f64 * 0.5) as usize;
 
     term.move_cursor_to(0, 0)?;
+    term.clear_line()?;
     term.write_line("DirMan")?;
 
-    let red = Style::new().red();
     let print_with_color = |text: &str, colored_list: Vec<CurrentArea>| -> io::Result<()> {
         let colored = if colored_list.contains(&selected_panel) {
-            format!("{}", red.apply_to(text))
+            format!("{}", text.color(Color::Red))
         } else {
             text.to_string()
         };
@@ -879,46 +1059,52 @@ fn file_size_to_str(size: u64) -> String {
     }
 }
 
-fn load_dir(dir_path: PathBuf) -> io::Result<DirectoryRef> {
-    let mut files: Vec<FileRef> = vec![];
-    let mut directories: Vec<DirectoryRef> = vec![];
+fn load_dir(dir_path: PathBuf, parent: Option<DirectoryRef>) -> io::Result<DirectoryRef> {
+    // let mut files: Vec<FileRef> = vec![];
+    // let mut directories: Vec<DirectoryRef> = vec![];
+
+    let this_dir = Rc::new(RefCell::new(Directory::new(dir_path.clone(), vec![], vec![], parent)));
 
     for entry in fs::read_dir(&dir_path)? {
         let entry = entry?;
         let entry_path = entry.path();
         
         if entry.file_type()?.is_dir() {
-            directories.push(load_dir(entry_path)?);
+            this_dir.borrow_mut().directories.push(load_dir(entry_path, Some(this_dir.clone()))?);
         } else {
-            files.push(Rc::new(RefCell::new(File::new(entry.path()))));
+            this_dir.borrow_mut().files.push(Rc::new(RefCell::new(File::new(entry.path()))));
         }
     }
 
-    Ok(Rc::new(RefCell::new(Directory::new(dir_path, files, directories))))
+    Ok(this_dir)
 }
 
 fn main() -> io::Result<()> {
     // parse command line arguments and extract directory
-    // let path = PathBuf::from(env::args().nth(1).expect("Usage: dirman <directory>"));
     let path = env::current_dir()?;
     if !path.is_dir() {
-        panic!("Input directory does not exist");
+        println!("Input directory does not exist");
+        return Ok(());
     }
 
     // construct directory tree
-    let root = load_dir(path)?;
+    let root = load_dir(path, None)?;
 
     let term = Term::stdout();
 
     // find dimensions for screen areas
     let size = Vector2 { x: term.size().1 as usize, y: term.size().0 as usize };
+    if size.x < 75 || size.y < 10 {
+        println!("Terminal window too small; terminal must be at least 75 units wide and 15 tall");
+        return Ok(());
+    }
 
-    for _ in 0..size.y {
+    for _ in 0..=size.y {
         term.write_line("")?;
     }
     draw_outline(&term, CurrentArea::Command)?;
 
-    let mut manager = StateManager::init(&term, root)?;
+    let mut manager = StateManager::init(&term, root.clone())?;
 
     term.move_cursor_to(3, size.y - 1)?;
 
