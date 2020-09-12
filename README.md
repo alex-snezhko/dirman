@@ -8,10 +8,14 @@ to simplify this process.
 Here is an example of DirMan running on this project's directory tree from Command Prompt:
 ![](https://github.com/alexsnezhko3/dirman/blob/master/dirman.png)
 
-The directory tree is pictured on the left half of the interface and the files in the currently selected directory on the right half.
-As pictured here, there are also arrows that appear on the edges of each panel of the view, indicating that there is more content in
-this panel that can be "scrolled" to in order to see.
-The area to enter commands to DirMan is on the bottom line of the interface.
+DirMan's interface has 3 main panels: the directory tree (left), the contents of the currently selected directory (right), and the
+command area (bottom). Interacting with DirMan is done mainly through commands, which are described in the below section.
+
+As pictured in the image, there may also be arrows that appear on the edges of each panel of the view; these indicate that there is
+more content in this panel that can be "scrolled" to in order to see. To scroll, navigate to the desired panel and then use W, A, S,
+and D to scroll up, left, down, and right respectively. Navigating between panels can be done with the arrow keys. If the command area is
+selected, arrow up will select the directory tree. Arrow right from there to select the current directory contents area. Arrow down
+to go back to the command area. Commands can only be inputted if the command area is currently selected.
 
 ## Commands
 
