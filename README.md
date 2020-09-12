@@ -15,30 +15,33 @@ The area to enter commands to DirMan is on the bottom line of the interface.
 
 ## Commands
 
-### Enter
+### Enter Directory
 `enter <directory>`: this command is used to change the currently selected directory.
 
-### Close
+### Close Directory
 `close <directory>`: this command is used to 'close' a directory in the tree. Closed directories do not have their child directories
 displayed in the directory tree panel.
 
-### Open
+### Open Directory
 `open <directory>`: this command is used to re-open a previously closed directory, so its child directories are once again shown.
 
-### Move
+### Move File
 `move <file> <new_directory>`: this command is used to move a file from the currently selected directory into a new directory.
 
-### Copy
+### Copy File
 `copy <file> <new_directory>`: this command is used to copy a file from the currently selected directory into a new directory.
 
-### Rename
+### Rename File/Directory
 `rename <file|directory> <new_name>`: this command is used to rename a file or directory.
 
-### New
+### Create File/Directory
 `new [file|directory] <name>`: this command is used to create a new file or a new directory and place it into the selected directory.
 
-### Remove
+### Remove File/Directory
 `remove <file|directory>`: this command is used to remove a file from the selected directory or directory in the tree.
+
+### Quit
+`q`: this command is used to exit the program.
 
 ## Working with directories
 
